@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>The Rise of On-Device AI — Test Article</title>
+    <style>
+        body { font-family: Georgia, serif; max-width: 760px; margin: 40px auto; line-height: 1.7; }
+        nav, footer { background: #eee; padding: 8px; }
+    </style>
+    <!-- Script and nav tags should be stripped by the content script -->
+    <script>var _tracking = "should not appear in extracted text";</script>
+</head>
+<body>
+
+    <nav>Home | About | Contact | Subscribe</nav>
+
+    <article>
+        <h1>The Rise of On-Device AI</h1>
+
+        <p>
+            For decades, artificial intelligence lived in data centers — enormous buildings packed with
+            specialized hardware that consumed as much power as a small city. Users sent requests over
+            the internet, waited for remote servers to process them, and received results back. The
+            experience was seamless, but it depended entirely on a reliable connection and a third
+            party's infrastructure.
+        </p>
+
+        <p>
+            That model is changing. Advances in model compression, quantization, and hardware
+            acceleration mean that sophisticated AI can now run directly on consumer devices:
+            phones, laptops, and even watches. Dr. Sarah Chen, a researcher at Stanford, describes
+            this shift as "the most significant democratization of AI since the smartphone."
+        </p>
+
+        <h2>Why Local Inference Matters</h2>
+
+        <p>
+            Privacy is the most obvious benefit. When your device handles inference locally, your
+            data never leaves it. No API keys, no usage logs, no third-party terms of service
+            governing your personal information. For sensitive tasks — medical queries, legal research,
+            personal journaling — this distinction is critical.
+        </p>
+
+        <p>
+            Latency is the second major advantage. A round trip to a remote server, even under ideal
+            conditions, adds hundreds of milliseconds. Local inference responds in under 50ms on
+            modern hardware, enabling applications that simply weren't possible before: real-time
+            speech synthesis, live translation, and instant document summarisation.
+        </p>
+
+        <blockquote>
+            "We are entering an era where the most powerful AI models fit in your pocket,
+             not just in a server rack." — Prof. James Whitfield, MIT Media Lab
+        </blockquote>
+
+        <h2>Current Limitations</h2>
+
+        <p>
+            On-device AI is not without trade-offs. The models that run efficiently on edge hardware
+            are, inevitably, smaller than their cloud-hosted counterparts. A quantised 7B-parameter
+            model competes admirably with GPT-3.5 on many benchmarks, but still falls short of the
+            largest frontier models.
+        </p>
+
+        <p>
+            Battery life is another concern. Running a language model continuously can drain a phone
+            battery in under 3 hours. Developers are addressing this through intelligent scheduling —
+            deferring heavy inference to moments when the device is plugged in and idle.
+        </p>
+
+        <h2>Practical Examples Today</h2>
+
+        <ul>
+            <li>Apple Intelligence processes most tasks on-device using Neural Engine acceleration.</li>
+            <li>Google's Gemini Nano runs locally on Pixel phones for summarisation and smart replies.</li>
+            <li>Open-source tools like Ollama let developers run Llama models on a MacBook with no internet.</li>
+            <li>This very extension uses Kokoro ONNX for on-device text-to-speech at 24kHz quality.</li>
+        </ul>
+
+        <h2>Looking Ahead</h2>
+
+        <p>
+            The trajectory is clear. By 2026, analyst firm IDC predicts that over 60% of enterprise
+            AI workloads will involve some degree of on-device or edge inference, up from less than
+            10% in 2023. The bottleneck is no longer algorithmic — it is hardware, tooling, and
+            developer education.
+        </p>
+
+        <p>
+            For users, the promise is simple: AI that works for you, on your hardware, on your terms.
+            No subscription required. No connection needed. Just intelligence, available whenever you
+            need it.
+        </p>
+    </article>
+
+    <footer>
+        &copy; 2026 Test Publication. All rights reserved.
+        <!-- Footer text should be stripped -->
+    </footer>
+
+</body>
+</html>

@@ -1,0 +1,58 @@
+{
+    "manifest_version": 3,
+    "name": "Kokoro TTS",
+    "version": "0.1.0",
+    "description": "Read any article aloud using on-device Kokoro TTS — no server required.",
+
+    "permissions": [
+        "activeTab",
+        "tabs",
+        "storage",
+        "scripting"
+    ],
+
+    "background": {
+        "service_worker": "service-worker.js"
+    },
+
+    "content_scripts": [
+        {
+            "matches": ["<all_urls>"],
+            "js": ["content-script.js"],
+            "run_at": "document_idle"
+        }
+    ],
+
+    "action": {
+        "default_popup": "popup.html",
+        "default_title": "Kokoro TTS",
+        "default_icon": {
+            "16": "icons/icon16.png",
+            "48": "icons/icon48.png",
+            "128": "icons/icon128.png"
+        }
+    },
+
+    "icons": {
+        "16": "icons/icon16.png",
+        "48": "icons/icon48.png",
+        "128": "icons/icon128.png"
+    },
+
+    "content_security_policy": {
+        "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    },
+
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "models/kokoro-v1.0.onnx",
+                "models/voices/*.bin",
+                "models/voices/manifest.json",
+                "wasm/*.wasm",
+                "tts-worker.js"
+            ],
+            "matches": ["<all_urls>"]
+        }
+    ]
+}

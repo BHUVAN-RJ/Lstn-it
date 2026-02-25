@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Kokoro TTS</title>
+    <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Kokoro TTS</h1>
+            <button id="themeToggle" class="theme-btn" title="Toggle dark mode">&#9789;</button>
+        </div>
+
+        <div id="status" class="status">Ready</div>
+
+        <div class="controls-panel">
+            <div class="control-row">
+                <label for="voiceSelect">Voice</label>
+                <select id="voiceSelect">
+                    <optgroup label="American Female">
+                        <option value="af_heart" selected>Heart</option>
+                        <option value="af_alloy">Alloy</option>
+                        <option value="af_aoede">Aoede</option>
+                        <option value="af_bella">Bella</option>
+                        <option value="af_jessica">Jessica</option>
+                        <option value="af_kore">Kore</option>
+                        <option value="af_nicole">Nicole</option>
+                        <option value="af_nova">Nova</option>
+                        <option value="af_river">River</option>
+                        <option value="af_sarah">Sarah</option>
+                        <option value="af_sky">Sky</option>
+                    </optgroup>
+                    <optgroup label="American Male">
+                        <option value="am_adam">Adam</option>
+                        <option value="am_echo">Echo</option>
+                        <option value="am_eric">Eric</option>
+                        <option value="am_fenrir">Fenrir</option>
+                        <option value="am_liam">Liam</option>
+                        <option value="am_michael">Michael</option>
+                        <option value="am_onyx">Onyx</option>
+                        <option value="am_puck">Puck</option>
+                        <option value="am_santa">Santa</option>
+                    </optgroup>
+                    <optgroup label="British Female">
+                        <option value="bf_alice">Alice</option>
+                        <option value="bf_emma">Emma</option>
+                        <option value="bf_isabella">Isabella</option>
+                        <option value="bf_lily">Lily</option>
+                    </optgroup>
+                    <optgroup label="British Male">
+                        <option value="bm_daniel">Daniel</option>
+                        <option value="bm_fable">Fable</option>
+                        <option value="bm_george">George</option>
+                        <option value="bm_lewis">Lewis</option>
+                    </optgroup>
+                </select>
+            </div>
+            <div class="control-row">
+                <label for="speedSlider">Speed</label>
+                <div class="speed-control">
+                    <input type="range" id="speedSlider" min="0.5" max="2.0" step="0.05" value="1.0" />
+                    <span id="speedValue">1.0x</span>
+                </div>
+            </div>
+        </div>
+
+        <button id="extractBtn" class="primary-btn">Extract &amp; Play</button>
+
+        <div id="player" class="player" style="display: none;">
+            <div class="controls">
+                <button id="playPauseBtn" class="icon-btn" title="Play / Pause (Space)">&#9654;</button>
+                <button id="stopBtn" class="icon-btn" title="Stop (Esc)">&#9632;</button>
+                <button id="downloadBtn" class="icon-btn" title="Save audio" disabled>&#11015;</button>
+            </div>
+            <div id="progress" class="progress-track">
+                <div id="progressBar" class="progress-fill"></div>
+            </div>
+        </div>
+
+        <div id="error" class="error-msg" style="display: none;"></div>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,265 @@
+/* ── CSS Custom Properties (light theme) ──────────────────────────────── */
+
+:root {
+    --bg:           #fff;
+    --text:         #202124;
+    --text-muted:   #5f6368;
+    --surface:      #f1f3f4;
+    --border:       #dadce0;
+    --accent:       #1a73e8;
+    --accent-hover: #1558b0;
+    --accent-bg:    #e8f0fe;
+    --accent-bg2:   #d2e3fc;
+    --disabled-bg:  #dadce0;
+    --disabled-text:#80868b;
+    --error-bg:     #fce8e6;
+    --error-text:   #c5221f;
+    --track:        #e0e0e0;
+}
+
+/* ── Dark theme ──────────────────────────────────────────────────────── */
+
+body.dark {
+    --bg:           #1e1e1e;
+    --text:         #e0e0e0;
+    --text-muted:   #9aa0a6;
+    --surface:      #2d2d2d;
+    --border:       #444;
+    --accent:       #8ab4f8;
+    --accent-hover: #aecbfa;
+    --accent-bg:    #2d3a4d;
+    --accent-bg2:   #3c4a5d;
+    --disabled-bg:  #3c3c3c;
+    --disabled-text:#6e6e6e;
+    --error-bg:     #4a2020;
+    --error-text:   #f28b82;
+    --track:        #444;
+}
+
+/* ── Base ────────────────────────────────────────────────────────────── */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    width: 300px;
+    padding: 20px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 14px;
+    background: var(--bg);
+    color: var(--text);
+    transition: background 0.2s, color 0.2s;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+
+h1 {
+    font-size: 18px;
+    font-weight: 600;
+    text-align: center;
+    letter-spacing: 0.3px;
+}
+
+.theme-btn {
+    position: absolute;
+    right: 0;
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
+}
+
+.theme-btn:hover {
+    background: var(--border);
+}
+
+.status {
+    padding: 8px 12px;
+    background: var(--surface);
+    border-radius: 6px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-muted);
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.primary-btn {
+    padding: 10px 20px;
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: background 0.15s;
+}
+
+.primary-btn:hover:not(:disabled) {
+    background: var(--accent-hover);
+}
+
+.primary-btn:disabled {
+    background: var(--disabled-bg);
+    color: var(--disabled-text);
+    cursor: not-allowed;
+}
+
+.player {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.controls {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+}
+
+.icon-btn {
+    width: 36px;
+    height: 36px;
+    border: none;
+    border-radius: 50%;
+    background: var(--accent-bg);
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
+}
+
+.icon-btn:hover:not(:disabled) {
+    background: var(--accent-bg2);
+}
+
+.icon-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.progress-track {
+    width: 100%;
+    height: 4px;
+    background: var(--track);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.progress-fill {
+    width: 0%;
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.3s ease;
+}
+
+/* ── Voice / Speed controls ──────────────────────────────────────────── */
+
+.controls-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.control-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.control-row label {
+    width: 44px;
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+.control-row select {
+    flex: 1;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--text);
+    cursor: pointer;
+    outline: none;
+}
+
+.control-row select:focus {
+    border-color: var(--accent);
+}
+
+.speed-control {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.speed-control input[type="range"] {
+    flex: 1;
+    height: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: var(--track);
+    border-radius: 2px;
+    outline: none;
+}
+
+.speed-control input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+}
+
+#speedValue {
+    width: 32px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+    text-align: right;
+}
+
+.error-msg {
+    padding: 10px 12px;
+    background: var(--error-bg);
+    color: var(--error-text);
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.5;
+}

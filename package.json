@@ -1,0 +1,27 @@
+{
+  "name": "tts-extension",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "webpack --config webpack.config.js",
+    "watch": "webpack --watch",
+    "dev": "webpack --mode development --watch",
+    "copy-model": "mkdir -p dist/models && cp models/kokoro-v1.0.onnx dist/models/kokoro-v1.0.onnx"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/preset-env": "^7.29.0",
+    "babel-loader": "^10.0.0",
+    "copy-webpack-plugin": "^13.0.1",
+    "webpack": "^5.105.2",
+    "webpack-cli": "^6.0.1"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.17.0",
+    "phonemizer": "^1.2.1"
+  }
+}
