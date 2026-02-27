@@ -5,7 +5,7 @@ const webpack = require('webpack');
 module.exports = {
     mode: 'production',
     entry: {
-        popup: './src/popup/popup.js',
+        offscreen: './src/offscreen/offscreen.js',
         'content-script': './src/content/content-script.js',
         'service-worker': './src/background/service-worker.js',
         'tts-worker': './src/worker/tts-worker.js',
@@ -49,8 +49,7 @@ module.exports = {
         new CopyPlugin({
             patterns: [
                 { from: 'src/manifest.json', to: 'manifest.json' },
-                { from: 'src/popup/popup.html', to: 'popup.html' },
-                { from: 'src/popup/popup.css', to: 'popup.css' },
+                { from: 'src/offscreen/offscreen.html', to: 'offscreen.html' },
                 { from: 'src/assets/icons', to: 'icons' },
                 // Voice embeddings (14MB) — small enough to copy on every build
                 { from: 'models/voices', to: 'models/voices' },

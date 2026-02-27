@@ -109,7 +109,7 @@ function splitParagraph(text) {
                 current += '..';
                 i += 2;
                 // Ellipsis mid-sentence — don't split
-            } else if (isAbbreviation(current) || isDecimalNumber(current, text, i)) {
+            } else if (isAbbreviation(current) || isDecimalNumber(current, text, i) || isListMarker(current)) {
                 // Don't split
             } else if (isFollowedByUpperOrEnd(text, i)) {
                 const trimmed = current.trim();
@@ -135,6 +135,17 @@ function isAbbreviation(current) {
     const match = current.match(/([A-Za-z]+)\.$/);
     if (!match) return false;
     return ABBREVS.has(match[1].toLowerCase());
+}
+
+/**
+ * True if the period follows a bare number with no preceding letters,
+ * indicating an ordered-list marker such as "1.", "2.", "42." rather than
+ * a sentence terminator.  Handles headings written in old-school HTML with
+ * <b>1. Determination</b> — common on sites like paulgraham.com.
+ */
+function isListMarker(current) {
+    // Strip everything before the trailing period, then check it's pure digits.
+    return /^\d+$/.test(current.slice(0, -1).trim());
 }
 
 /** True if the period is part of a decimal number, e.g. "3.14" */

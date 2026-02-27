@@ -7,6 +7,7 @@ import * as ort from 'onnxruntime-web';
 import { phonemize } from 'phonemizer';
 import { normalizeForKokoro } from './phoneme-normalizer.js';
 import { tokenize } from './tokenizer.js';
+import { applyPronunciationMap } from './pronunciation-map.js';
 
 // ── ort environment — set at module level, before InferenceSession.create() ──
 ort.env.wasm.numThreads = 1;
@@ -41,6 +42,159 @@ function postError(code, detail) { post({ type: 'ERROR', code, detail }); }
 function getStyleVector(tokenCount) {
     const idx = Math.min(tokenCount, 509);
     return voiceData.slice(idx * 256, idx * 256 + 256);
+}
+
+// ── Number / year expansion (moved from text-cleaner.js) ─────────────────────
+//
+// Keeping this in the worker (rather than text-cleaner) means sentence text
+// remains in its original form all the way to the highlight-injector, so
+// DOM position searches succeed even when text contains years like "2025".
+
+const _ONES = [
+    '', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+    'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen',
+    'seventeen', 'eighteen', 'nineteen',
+];
+const _TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+const _DECADE_S = {
+    'ten': 'tens', 'twenty': 'twenties', 'thirty': 'thirties', 'forty': 'forties',
+    'fifty': 'fifties', 'sixty': 'sixties', 'seventy': 'seventies',
+    'eighty': 'eighties', 'ninety': 'nineties',
+};
+
+function _twoDigit(n) {
+    if (n <= 0)  return '';
+    if (n < 20)  return _ONES[n];
+    const t = Math.floor(n / 10), o = n % 10;
+    return o === 0 ? _TENS[t] : `${_TENS[t]}-${_ONES[o]}`;
+}
+
+function _yearToWords(y, hasSuffix) {
+    const high = Math.floor(y / 100);
+    const low  = y % 100;
+    let words;
+    if (y === 2000) {
+        return hasSuffix ? 'two thousands' : 'two thousand';
+    } else if (y >= 2001 && y <= 2009) {
+        words = `two thousand ${_ONES[low]}`;
+    } else if (y >= 2010 && y <= 2099) {
+        words = `twenty ${_twoDigit(low)}`;
+    } else if (y >= 1000 && y <= 1999) {
+        if (low === 0)       words = `${_twoDigit(high)} hundred`;
+        else if (low < 10)   words = `${_twoDigit(high)} oh ${_ONES[low]}`;
+        else                 words = `${_twoDigit(high)} ${_twoDigit(low)}`;
+    } else {
+        return String(y) + (hasSuffix ? 's' : '');
+    }
+    if (!hasSuffix) return words;
+    const parts = words.split(' ');
+    const last  = parts[parts.length - 1];
+    if (_DECADE_S[last]) { parts[parts.length - 1] = _DECADE_S[last]; return parts.join(' '); }
+    return words + 's';
+}
+
+function expandNumbers(text) {
+    // Currency: $50 → "50 dollars"
+    text = text.replace(/\$(\d+(?:\.\d{1,2})?)/g, (_, n) => `${n} dollars`);
+    // Percentages: 25% → "25 percent"
+    text = text.replace(/(\d+(?:\.\d+)?)\s*%/g, (_, n) => `${n} percent`);
+    // Years: 1980 → "nineteen eighty", 1980s → "nineteen eighties"
+    text = text.replace(/\b(1[0-9]{3}|20[0-9]{2})(s)?\b/g,
+        (_m, year, suffix) => _yearToWords(parseInt(year, 10), !!suffix));
+    // Ordinal list markers at sentence start: "1. Determination" → "one. Determination"
+    // espeak-ng may silently suppress or mangle bare digits used as list labels,
+    // producing empty phonemes → tokenIds.length ≤ 2 → sentence skipped.
+    // Converting to word form gives the phonemizer unambiguous input.
+    text = text.replace(/^(\d{1,2})\. (?=[A-Z])/, (_, num) => {
+        const n = parseInt(num, 10);
+        return (n > 0 && n < _ONES.length ? _ONES[n] : num) + '. ';
+    });
+    return text;
+}
+
+/**
+ * Expand all-caps words (2+ letters) to space-separated letters.
+ * Runs AFTER applyPronunciationMap so specific overrides take priority.
+ *   "FBI"  → "F B I"
+ *   "NASA" → "N A S A"
+ *   "AI"   → "A I"
+ *
+ * Single uppercase letters (e.g. "I", "A") are left untouched.
+ * Mixed-case words (e.g. "iPhone", "WePay") are not affected.
+ * Words already expanded by the pronunciation map ("eh W S") are not re-expanded
+ * because individual letters don't form a 2+ consecutive uppercase run after spacing.
+ */
+function expandAllCaps(text) {
+    return text.replace(/\b[A-Z]{2,}\b/g, (match) => match.split('').join(' '));
+}
+
+// ── Clause-boundary splitting ─────────────────────────────────────────────────
+
+// Maps each clause-boundary delimiter to the Kokoro IPA token it should inject.
+// Kokoro's vocabulary (tokenizer.js) contains these punctuation tokens:
+//   ;=1  :=2  ,=3  .=4  !=5  ?=6  —=9
+// En-dash (–, U+2013) is NOT in the vocab — substitute em-dash (—, U+2014).
+// By appending the token to the IPA string we let the model generate natural
+// prosody (comma intonation, colon pause, etc.) rather than inserting silence.
+const CLAUSE_TOKENS = {
+    ',':      ',',      // token 3
+    ';':      ';',      // token 1
+    ':':      ':',      // token 2
+    '\u2014': '\u2014', // em-dash — token 9
+    '\u2013': '\u2014', // en-dash → mapped to em-dash
+};
+
+/**
+ * Split sentence text at clause boundaries (comma, semicolon, colon, em-dash,
+ * en-dash).  Returns the clause text WITHOUT the trailing delimiter (delimiter
+ * is injected directly into the IPA string in generateAudio so Kokoro receives
+ * the correct punctuation token and generates natural prosody).
+ *
+ * Guards:
+ *   - comma between digits → thousands separator ("3,000") — not split
+ *   - colon between digits → time / ratio ("10:30", "1:2")  — not split
+ *
+ * @param {string} text
+ * @returns {{ text: string, delimToken: string }[]}
+ *   text       — clause text WITHOUT trailing delimiter, ready for the phonemizer
+ *   delimToken — IPA punctuation char to append after phonemization ('' for last clause)
+ */
+function splitAtClauseBoundaries(text) {
+    // Normalise spaced hyphens (" - ") used as em-dash in plain-text writing.
+    text = text.replace(/ - /g, ' \u2014 ');
+
+    const result = [];
+    const re = /[,;:\u2014\u2013]/g;
+    let last = 0;
+    let match;
+
+    while ((match = re.exec(text)) !== null) {
+        const pos   = match.index;
+        const delim = match[0];
+
+        // Guard: comma between digits → thousands separator
+        if (delim === ',' && pos > 0 && pos + 1 < text.length) {
+            if (/\d/.test(text[pos - 1]) && /\d/.test(text[pos + 1])) continue;
+        }
+        // Guard: colon between digits → time or ratio
+        if (delim === ':' && pos > 0 && pos + 1 < text.length) {
+            if (/\d/.test(text[pos - 1]) && /\d/.test(text[pos + 1])) continue;
+        }
+
+        // Only split if there is actual text before this delimiter
+        const clauseText = text.slice(last, pos).trim();
+        if (clauseText.length === 0) continue;
+
+        result.push({ text: clauseText, delimToken: CLAUSE_TOKENS[delim] ?? '' });
+        last = pos + 1;
+    }
+
+    // Last clause — no delimiter to inject; sentence-level pause handled externally
+    const remaining = text.slice(last).trim();
+    if (remaining) result.push({ text: remaining, delimToken: '' });
+
+    if (result.length === 0) return [{ text, delimToken: '' }];
+    return result;
 }
 
 // ── Long-phoneme handling ─────────────────────────────────────────────────────
@@ -226,64 +380,117 @@ async function generateAudio({ sentences, speed = 1.0, genId = 0 }) {
     for (let i = 0; i < sentences.length; i++) {
         if (cancelId !== myId) return; // cancelled / superseded
 
-        const { text, endsWithParagraph, endsWithSection = false } = sentences[i];
+        const { text: rawText, endsWithParagraph, endsWithSection = false } = sentences[i];
+        // Expand numbers/years then apply pronunciation overrides here (not in
+        // text-cleaner) so that sentence text stays in its original form for
+        // the highlight-injector's DOM searches.
+        const text = expandAllCaps(applyPronunciationMap(expandNumbers(rawText)));
 
-        // 1. Phonemize
-        const phonemes = await phonemizeSentence(text);
-        if (cancelId !== myId) return;
+        // 1. Split sentence at clause boundaries (comma, semicolon, colon, em/en-dash).
+        //    Each clause is phonemized and inferred independently so the model receives
+        //    clean input, and an explicit silence gap is scheduled between clauses.
+        const clauses = splitAtClauseBoundaries(text);
 
-        console.log(`[tts-worker] [${i + 1}/${total}] phonemes (${phonemes.length} chars): "${phonemes.slice(0, 80)}${phonemes.length > 80 ? '…' : ''}"`);
-        post({ type: 'PHONEMES_READY', index: i, total, text, phonemes });
-
-        // 2. Split sentences that exceed the phoneme threshold into exactly two parts.
-        //    Part 1 (main): counts as one unit toward the chunksAhead buffer counter.
-        //    Part 2 (overflow): plays seamlessly after part 1; invisible to the counter.
-        const parts = splitLongSentence(phonemes);
-        if (parts.length > 1) {
-            console.log(`[tts-worker] [${i + 1}/${total}] long sentence split into 2 phoneme parts`);
-        }
-
-        for (let pi = 0; pi < parts.length; pi++) {
+        for (let ci = 0; ci < clauses.length; ci++) {
             if (cancelId !== myId) return;
 
-            const isLastPart  = pi === parts.length - 1;
-            // Part 1 is the "main" chunk — it counts toward the playback buffer.
-            // Part 2 (overflow) does not; it is an invisible tail of the same sentence.
-            const countAsChunk = pi === 0;
+            const { text: clauseText, delimToken } = clauses[ci];
+            const isLastClause = ci === clauses.length - 1;
 
-            // 3. Tokenize
-            const tokenIds = tokenize(parts[pi]);
-            if (tokenIds.length <= 2) {
-                console.warn(`[tts-worker] skipping part ${pi + 1}/${parts.length} of sentence ${i + 1}: no tokens`);
-                continue;
+            // Detect parenthetical pattern: ", word(s)," — two consecutive comma boundaries.
+            // e.g. "for this to work, though, you have to be"
+            //       clause: "for this to work"  delimToken: ','
+            //       clause: "though"            delimToken: ','  ← isParenthetical
+            //       clause: "you have to be"    delimToken: ''
+            // For a parenthetical clause we do NOT inject the comma token into the IPA
+            // (that creates awkward short-phrase intonation in the model).  Instead we
+            // schedule a small explicit silence so the phrasing still breathes naturally.
+            const prevDelimToken = ci > 0 ? clauses[ci - 1].delimToken : '';
+            const isParenthetical = !isLastClause
+                                 && delimToken === ','
+                                 && prevDelimToken === ',';
+
+            // 2. Phonemize the clause.
+            //    For non-last, non-parenthetical clauses we append the delimiter char to
+            //    the IPA so Kokoro receives the correct punctuation token and generates
+            //    natural prosody (,=3  ;=1  :=2  —=9).
+            //    Parenthetical clauses skip token injection; a 60ms explicit gap is used.
+            let phonemes = await phonemizeSentence(clauseText);
+            if (cancelId !== myId) return;
+
+            if (!isLastClause && delimToken && !isParenthetical) {
+                // e.g. "həlˈoʊ" + "," → "həlˈoʊ,"  → token 3 → natural comma prosody
+                phonemes = phonemes.trimEnd() + delimToken;
             }
 
-            // 4. Infer
-            const samples = await runInference(tokenIds, speed);
-            if (cancelId !== myId) return;
-            if (!samples) continue;
+            // Log phonemes once per sentence (from first clause)
+            if (ci === 0) {
+                console.log(`[tts-worker] [${i + 1}/${total}] phonemes (${phonemes.length} chars): "${phonemes.slice(0, 80)}${phonemes.length > 80 ? '…' : ''}"`);
+                post({ type: 'PHONEMES_READY', index: i, total, text, phonemes });
+            } else {
+                console.log(`[tts-worker] [${i + 1}/${total}] clause ${ci + 1}/${clauses.length} phonemes (${phonemes.length} chars): "${phonemes.slice(0, 60)}${phonemes.length > 60 ? '…' : ''}"`);
+            }
 
-            console.log(`[tts-worker] [${i + 1}/${total}] part ${pi + 1}/${parts.length}: ${samples.length} samples (${(samples.length / 24000).toFixed(2)}s)`);
+            // 3. Split clauses that exceed the phoneme threshold into exactly two parts.
+            //    Part 1 (main): counts as one unit toward the chunksAhead buffer counter.
+            //    Part 2 (overflow): plays seamlessly after part 1; invisible to the counter.
+            const parts = splitLongSentence(phonemes);
+            if (parts.length > 1) {
+                console.log(`[tts-worker] [${i + 1}/${total}] clause ${ci + 1}: long phoneme string split into 2 parts`);
+            }
 
-            // 5. Transfer samples buffer to popup (zero-copy).
-            //    Only the last part carries the sentence-boundary pause metadata.
-            //    Part 1 of a split sentence has isMidChunk=true (0ms gap before part 2).
-            const samplesCopy = new Float32Array(samples);
-            post(
-                {
-                    type: 'AUDIO_CHUNK',
-                    index: i,
-                    total,
-                    samples: samplesCopy,
-                    sampleRate: 24000,
-                    endsWithParagraph: isLastPart ? endsWithParagraph : false,
-                    endsWithSection:   isLastPart ? endsWithSection   : false,
-                    isMidChunk:   !isLastPart,   // true only for part 1 of a 2-part sentence
-                    countAsChunk,                // false for overflow part — skip chunksAhead
-                    genId,
-                },
-                [samplesCopy.buffer]
-            );
+            for (let pi = 0; pi < parts.length; pi++) {
+                if (cancelId !== myId) return;
+
+                const isLastPart = pi === parts.length - 1;
+
+                // countAsChunk: true only for the very first part of the first clause —
+                // the whole sentence still counts as exactly ONE pre-buffer unit.
+                const countAsChunk = ci === 0 && pi === 0;
+
+                // 4. Tokenize
+                const tokenIds = tokenize(parts[pi]);
+                if (tokenIds.length <= 2) {
+                    console.warn(`[tts-worker] skipping clause ${ci + 1}, part ${pi + 1} of sentence ${i + 1}: no tokens`);
+                    continue;
+                }
+
+                // 5. Infer
+                const samples = await runInference(tokenIds, speed);
+                if (cancelId !== myId) return;
+                if (!samples) continue;
+
+                console.log(`[tts-worker] [${i + 1}/${total}] clause ${ci + 1}/${clauses.length} part ${pi + 1}/${parts.length}: ${samples.length} samples (${(samples.length / 24000).toFixed(2)}s)`);
+
+                // Scheduling pause after this chunk:
+                //   overflow part (non-last part)          → 0ms      seamless join
+                //   last part of last clause               → undefined → sentence-level pause
+                //   last part of any other clause          → 0ms      (Kokoro prosody baked in;
+                //                                            parenthetical comma already dropped)
+                const pauseAfterMs = !isLastPart  ? 0
+                                   : isLastClause ? undefined
+                                   : 0;
+
+                // 6. Transfer samples buffer (zero-copy).
+                //    Sentence-boundary metadata only travels on the last part of the last clause.
+                const samplesCopy = new Float32Array(samples);
+                post(
+                    {
+                        type: 'AUDIO_CHUNK',
+                        index: i,
+                        total,
+                        samples: samplesCopy,
+                        sampleRate: 24000,
+                        endsWithParagraph: isLastPart && isLastClause ? endsWithParagraph : false,
+                        endsWithSection:   isLastPart && isLastClause ? endsWithSection   : false,
+                        isMidChunk:   !isLastPart,   // true for overflow tail of a long-clause split
+                        countAsChunk,
+                        pauseAfterMs,
+                        genId,
+                    },
+                    [samplesCopy.buffer]
+                );
+            }
         }
     }
 

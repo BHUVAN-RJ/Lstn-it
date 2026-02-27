@@ -47,6 +47,14 @@ function _walk(node, parts) {
     const tag = node.tagName.toLowerCase();
     if (STRIP_TAGS.has(tag)) return;
 
+    // Skip Medium.com article metadata elements (read time, publish date, author name).
+    // These carry data-testid attributes specific to the Medium platform.
+    const testId = node.getAttribute('data-testid');
+    if (testId === 'storyReadTime' || testId === 'storyPublishDate' || testId === 'authorName') return;
+
+    // <br> → single newline (treated as a soft paragraph break)
+    if (tag === 'br') { parts.push('\n'); return; }
+
     const isBlock   = BLOCK_TAGS.has(tag);
     const isHeading = HEADING_TAGS.has(tag);
 
@@ -68,13 +76,15 @@ function _walk(node, parts) {
 const QUOTE_MAP = {
     '\u2019': "'", '\u2018': "'", '\u0060': "'", '\u00B4': "'",
     '\u201C': '"', '\u201D': '"', '\u2033': '"',
-    '\u2013': '-', '\u2014': '-',
+    // \u2013 (en-dash) and \u2014 (em-dash) are intentionally NOT mapped here.
+    // They are preserved so splitAtClauseBoundaries() in tts-worker can detect
+    // them as clause boundaries and insert the appropriate pause.
     '\u2026': '...',
     '\u00A0': ' ',  // non-breaking space
 };
 
 function normalizeApostrophes(text) {
-    return text.replace(/[\u2019\u2018\u0060\u00B4\u201C\u201D\u2033\u2013\u2014\u2026\u00A0]/g,
+    return text.replace(/[\u2019\u2018\u0060\u00B4\u201C\u201D\u2033\u2026\u00A0]/g,
         (ch) => QUOTE_MAP[ch] ?? ch);
 }
 
@@ -89,18 +99,11 @@ function removeUrls(text) {
     return text.replace(/https?:\/\/\S+/g, '').replace(/www\.\S+/g, '');
 }
 
-/**
- * Expand a small set of common numeric patterns to words.
- * A full implementation (num2words) comes in a later phase if needed.
- */
-function expandNumbers(text) {
-    // Currency: $50 → "50 dollars"
-    text = text.replace(/\$(\d+(?:\.\d{1,2})?)/g, (_, n) => `${n} dollars`);
-    // Percentages: 25% → "25 percent"
-    text = text.replace(/(\d+(?:\.\d+)?)\s*%/g, (_, n) => `${n} percent`);
-    // Plain integers left as-is for now; phonemizer handles them adequately
-    return text;
-}
+// NOTE: Number/year expansion (expandNumbers, expandYears, _yearToWords, etc.)
+// has been moved to tts-worker.js so that sentence text stays in its original
+// form here. The highlight-injector searches for sentence text in the raw DOM
+// buffer — if years were expanded (2025 → "twenty twenty-five") the search
+// would fail to locate the sentence and highlighting would be silently skipped.
 
 function collapseWhitespace(text) {
     // Collapse runs of spaces/tabs on a single line
@@ -108,6 +111,27 @@ function collapseWhitespace(text) {
     // Collapse 3+ newlines to 2
     text = text.replace(/\n{3,}/g, '\n\n');
     return text.trim();
+}
+
+/**
+ * Strip inline footnote reference markers and section-heading artifacts.
+ *
+ * "[N]"   — footnote refs like [1], [2] anywhere in the text.
+ *           Stripped unconditionally: the DOM may place a newline (not a space)
+ *           before the marker, so a space-only guard misses them.
+ *
+ * "Notes" — standalone section heading before the footnote list.
+ */
+function stripFootnoteMarkers(text) {
+    // Remove all [N] markers.
+    text = text.replace(/\[\d+\]/g, '');
+    // Remove standalone "Notes" heading before the footnotes section.
+    text = text.replace(/(^|\n\n)Notes\n\n/g, '$1');
+    // Remove Medium.com newsletter subscription widget.
+    // The h2 heading is a HEADING_TAG so it may be preceded by a \u0000 sentinel.
+    // Pattern: "Get [Author]'s stories in your inbox\n\nJoin Medium for free..."
+    text = text.replace(/\u0000?\n*Get .+ stories in your inbox\n+Join Medium for free to get updates from this writer\.\n*/g, '\n\n');
+    return text;
 }
 
 /** Returns true if text has at least one alphabetic character */
@@ -125,8 +149,10 @@ export function extractTextFromElement(rootEl) {
     text = normalizeApostrophes(text);
     text = removeEmojis(text);
     text = removeUrls(text);
-    text = expandNumbers(text);
+    // expandNumbers intentionally omitted — runs in tts-worker instead so that
+    // sentence text stays raw for the highlight-injector's indexOf searches.
     text = collapseWhitespace(text);
+    text = stripFootnoteMarkers(text);
     return text;
 }
 
@@ -138,8 +164,8 @@ export function cleanText(rawText) {
     text = normalizeApostrophes(text);
     text = removeEmojis(text);
     text = removeUrls(text);
-    text = expandNumbers(text);
     text = collapseWhitespace(text);
+    text = stripFootnoteMarkers(text);
     return text;
 }
 

@@ -1,14 +1,17 @@
 {
     "manifest_version": 3,
     "name": "Kokoro TTS",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Read any article aloud using on-device Kokoro TTS — no server required.",
 
     "permissions": [
         "activeTab",
         "tabs",
         "storage",
-        "scripting"
+        "scripting",
+        "offscreen",
+        "contextMenus",
+        "downloads"
     ],
 
     "background": {
@@ -24,8 +27,7 @@
     ],
 
     "action": {
-        "default_popup": "popup.html",
-        "default_title": "Kokoro TTS",
+        "default_title": "Kokoro TTS — Read this page aloud",
         "default_icon": {
             "16": "icons/icon16.png",
             "48": "icons/icon48.png",
@@ -50,7 +52,8 @@
                 "models/voices/*.bin",
                 "models/voices/manifest.json",
                 "wasm/*.wasm",
-                "tts-worker.js"
+                "tts-worker.js",
+                "offscreen.html"
             ],
             "matches": ["<all_urls>"]
         }
