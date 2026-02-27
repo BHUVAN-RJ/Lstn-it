@@ -28,6 +28,13 @@ let audioOutName  = 'audio';     // first output name
 // at any subsequent check the generation exits immediately.
 let cancelId = 0;
 
+// Mid-generation voice switching: SWITCH_VOICE sets this flag instead of loading
+// immediately (because the onmessage macrotask can't run while generateAudio's
+// microtask chain is active). generateAudio yields to the macrotask queue between
+// sentences and picks up the pending voice.
+let pendingVoice = null;
+let isGenerating = false;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function post(msg, transfer) {
@@ -365,7 +372,7 @@ async function runInference(tokenIds, speed = 1.0) {
  * @param {number} speed
  * @param {number} genId  - opaque ID echoed back in every AUDIO_CHUNK / GENERATION_DONE
  */
-async function generateAudio({ sentences, speed = 1.0, genId = 0 }) {
+async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0 }) {
     if (!session || !voiceData) {
         postError('MODEL_NOT_READY', 'Load the model first.');
         return;
@@ -374,11 +381,42 @@ async function generateAudio({ sentences, speed = 1.0, genId = 0 }) {
     // Claim a new generation slot — invalidates any still-running previous generation.
     cancelId++;
     const myId = cancelId;
+    isGenerating = true;
+
+    // Load the requested voice BEFORE processing any sentences.
+    // This guarantees the correct voice for the entire generation regardless of
+    // any concurrent SWITCH_VOICE messages or race conditions in message ordering.
+    // Also consume any pendingVoice that was set while no generation was running.
+    const targetVoice = pendingVoice || voice;
+    pendingVoice = null;
+    console.log('[tts-worker] generateAudio: requested voice =', targetVoice, ', active voice =', activeVoice);
+    if (targetVoice && targetVoice !== activeVoice) {
+        console.log('[tts-worker] generateAudio: switching voice', activeVoice, '→', targetVoice);
+        await loadVoice(targetVoice);
+        if (cancelId !== myId) { isGenerating = false; return; }
+        console.log('[tts-worker] generateAudio: voice loaded, activeVoice =', activeVoice);
+    }
 
     const total = sentences.length;
 
     for (let i = 0; i < sentences.length; i++) {
-        if (cancelId !== myId) return; // cancelled / superseded
+        // Yield to the macrotask queue so that queued SWITCH_VOICE messages
+        // (which set pendingVoice) get a chance to run. Without this yield,
+        // the async/await microtask chain keeps the event loop busy and
+        // onmessage for SWITCH_VOICE never fires until generation completes.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        if (cancelId !== myId) { isGenerating = false; return; }
+
+        // Check for mid-generation voice switch
+        if (pendingVoice && pendingVoice !== activeVoice) {
+            console.log('[tts-worker] mid-generation voice switch:', activeVoice, '→', pendingVoice);
+            await loadVoice(pendingVoice);
+            pendingVoice = null;
+            post({ type: 'VOICE_READY', voice: activeVoice });
+            if (cancelId !== myId) { isGenerating = false; return; }
+        }
+
+        if (cancelId !== myId) { isGenerating = false; return; } // cancelled / superseded
 
         const { text: rawText, endsWithParagraph, endsWithSection = false } = sentences[i];
         // Expand numbers/years then apply pronunciation overrides here (not in
@@ -494,6 +532,7 @@ async function generateAudio({ sentences, speed = 1.0, genId = 0 }) {
         }
     }
 
+    isGenerating = false;
     if (cancelId === myId) {
         post({ type: 'GENERATION_DONE', total, genId });
     }
@@ -511,8 +550,16 @@ self.onmessage = async (event) => {
                 await loadModel(payload);
                 break;
             case 'SWITCH_VOICE':
-                await loadVoice(payload.voice);
-                post({ type: 'VOICE_READY', voice: activeVoice });
+                if (isGenerating) {
+                    // Don't block — just set the flag for generateAudio to pick up
+                    // on its next sentence boundary (after it yields to macrotask queue).
+                    pendingVoice = payload.voice;
+                    console.log('[tts-worker] SWITCH_VOICE during generation — queued:', pendingVoice);
+                } else {
+                    await loadVoice(payload.voice);
+                    pendingVoice = null;
+                    post({ type: 'VOICE_READY', voice: activeVoice });
+                }
                 break;
             case 'CANCEL':
                 // Increment the shared counter — any in-progress generateAudio loop

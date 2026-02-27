@@ -254,6 +254,25 @@ export const WIDGET_CSS = `
     flex-shrink: 0;
 }
 
+/* ── Voice change notification ───────────────────────────────────────────── */
+.tts-voice-notify {
+    color: #a5b4fc;
+    font-size: 10px;
+    font-weight: 600;
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    animation: tts-notify-fade 2s ease forwards;
+}
+
+@keyframes tts-notify-fade {
+    0%   { opacity: 0; }
+    12%  { opacity: 1; }
+    75%  { opacity: 1; }
+    100% { opacity: 0; }
+}
+
 /* ── Dragging ────────────────────────────────────────────────────────────── */
 .tts-widget.dragging {
     cursor: grabbing;

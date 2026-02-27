@@ -9,8 +9,9 @@ function notifySW(message) {
 }
 
 // ── Worker state ────────────────────────────────────────────────────────────
-let ttsWorker  = null;
-let modelReady = false;
+let ttsWorker       = null;
+let modelReady      = false;
+let currentVoiceName = null; // tracks desired voice; passed in every GENERATE_AUDIO
 
 // ── Audio state ─────────────────────────────────────────────────────────────
 let audioContext           = null;
@@ -511,8 +512,21 @@ function initWorker(voice) {
 
 // ── Start generation from extraction result ─────────────────────────────────
 
-function startGeneration(message) {
+async function startGeneration(message) {
     console.log('[offscreen] startGeneration() —', message.sentences?.length, 'sentences,', message.wordCount, 'words');
+
+    // Read the latest voice preference directly from storage.
+    // This is the definitive source of truth — bypasses all messaging paths.
+    try {
+        if (chrome.storage?.local) {
+            const result = await chrome.storage.local.get(['voice']);
+            if (result.voice) {
+                currentVoiceName = result.voice;
+            }
+        }
+    } catch (_) {}
+    console.log('[offscreen] startGeneration voice:', currentVoiceName);
+
     autoPlayMode = message.autoPlay !== false; // default true; EXTRACT_AND_STAGE sets false
     resetAudio();
     articleTitle = message.title || '';
@@ -522,6 +536,7 @@ function startGeneration(message) {
         type:      'GENERATE_AUDIO',
         sentences: message.sentences,
         speed:     currentUserSpeed,
+        voice:     currentVoiceName, // worker loads this voice before starting inference
         genId:     currentGenId,
     });
 
@@ -576,8 +591,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'SWITCH_VOICE': {
+            console.log('[offscreen] SWITCH_VOICE received, voice:', message.voice, 'ttsWorker:', !!ttsWorker, 'modelReady:', modelReady);
+            // Track the desired voice so it is included in the next GENERATE_AUDIO
+            currentVoiceName = message.voice;
             if (!ttsWorker || !modelReady) return false;
             ttsWorker.postMessage({ type: 'SWITCH_VOICE', voice: message.voice });
+            return false;
+        }
+
+        case 'WIDGET_ACTION': {
+            console.log('[offscreen] WIDGET_ACTION received, action:', message.action, message.action === 'SWITCH_VOICE' ? 'voice: ' + message.voice : '');
+            // Content script → offscreen via chrome.runtime.sendMessage is reliable.
+            // Track voice here too in case the SW relay never arrives.
+            if (message.action === 'SWITCH_VOICE') {
+                currentVoiceName = message.voice;
+                if (ttsWorker && modelReady) {
+                    ttsWorker.postMessage({ type: 'SWITCH_VOICE', voice: message.voice });
+                }
+            }
             return false;
         }
 
@@ -635,6 +666,7 @@ async function loadPreferences() {
 (async () => {
     console.log('[offscreen] initializing...');
     const voice = await loadPreferences();
+    currentVoiceName = voice; // track so startGeneration always passes the right voice
     console.log('[offscreen] loaded prefs, voice:', voice, 'speed:', currentUserSpeed);
     initWorker(voice);
     console.log('[offscreen] initWorker called, waiting for MODEL_READY...');

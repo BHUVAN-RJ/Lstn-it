@@ -114,6 +114,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             activeTtsTabId = sender.tab.id;
             console.log('[service-worker] activeTtsTabId set to', activeTtsTabId);
         } else if (message.type === 'WIDGET_ACTION') {
+            console.log('[service-worker] WIDGET_ACTION:', message.action, message.action === 'SWITCH_VOICE' ? message.voice : '');
             // Translate widget actions to messages the offscreen understands
             const actionMap = {
                 'TOGGLE_PLAY_PAUSE': { type: 'TOGGLE_PLAY_PAUSE' },
@@ -125,7 +126,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             };
             const mapped = actionMap[message.action];
             if (mapped) {
-                chrome.runtime.sendMessage(mapped).catch(() => {});
+                console.log('[service-worker] relaying to offscreen:', mapped.type, mapped.voice ?? '');
+                chrome.runtime.sendMessage(mapped).catch((err) => {
+                    console.error('[service-worker] relay FAILED:', err);
+                });
             }
         }
         return false;

@@ -14,10 +14,14 @@ const ICON_DONE = `<svg viewBox="0 0 24 24" class="tts-circle-icon"><path d="M9 
 // ── Voice list ──────────────────────────────────────────────────────────────
 
 const VOICE_GROUPS = {
-    'American Female': ['af_heart', 'af_alloy', 'af_aoede', 'af_bella', 'af_jessica', 'af_kore', 'af_nicole', 'af_nova', 'af_river', 'af_sarah', 'af_sky'],
-    'American Male': ['am_adam', 'am_echo', 'am_eric', 'am_fenrir', 'am_liam', 'am_michael', 'am_onyx', 'am_puck'],
-    'British Female': ['bf_alice', 'bf_emma', 'bf_isabella', 'bf_lily'],
-    'British Male': ['bm_daniel', 'bm_fable', 'bm_george', 'bm_lewis', 'bm_oliver'],
+    'Default': ['af_aoede'],
+    'Favorites': ['af_sarah', 'af_heart', 'af_sky', 'af_bella', 'af_jessica', 'af_kore', 'af_nova', 'am_eric', 'bf_lily'],
+    'More Voices': [
+        'af_alloy', 'af_nicole', 'af_river',
+        'am_adam', 'am_echo', 'am_fenrir', 'am_liam', 'am_michael', 'am_onyx', 'am_puck',
+        'bf_alice', 'bf_emma', 'bf_isabella',
+        'bm_daniel', 'bm_fable', 'bm_george', 'bm_lewis',
+    ],
 };
 
 // ── Widget creation ─────────────────────────────────────────────────────────
@@ -32,6 +36,10 @@ let currentState = 'loading'; // loading | playing | paused | done | stopped
 let seekerSlider = null;
 let seekerTime = null;
 let isSeeking = false;
+
+// Voice picker state
+let voiceSelectEl = null;
+let voiceNotifyTimeout = null;
 
 // Hover-gap timer — keeps menu open while mouse crosses the gap between circle and radial items
 let hoverTimer = null;
@@ -145,6 +153,7 @@ export function createWidget(shadow, shadowHost) {
     buildVoiceOptions(voiceSelect);
     voiceSelect.addEventListener('change', onVoiceChange);
     voiceSelect.addEventListener('click', (e) => e.stopPropagation());
+    voiceSelectEl = voiceSelect; // module-level ref for notification
     voiceContainer.appendChild(voiceLabel);
     voiceContainer.appendChild(voiceSelect);
     voiceItem.appendChild(voiceContainer);
@@ -192,9 +201,12 @@ function buildVoiceOptions(select) {
 async function loadWidgetPreferences(voiceSelect, speedSlider, speedValue) {
     try {
         const result = await chrome.storage.local.get(['voice', 'speed']);
-        if (result.voice && voiceSelect.querySelector(`option[value="${result.voice}"]`)) {
-            voiceSelect.value = result.voice;
-        }
+        const savedVoice = result.voice && voiceSelect.querySelector(`option[value="${result.voice}"]`)
+            ? result.voice
+            : 'af_aoede';
+        voiceSelect.value = savedVoice;
+        // Persist the default so offscreen always has a voice set
+        if (!result.voice) chrome.storage.local.set({ voice: savedVoice }).catch(() => {});
         if (result.speed != null) {
             const speed = parseFloat(result.speed);
             if (speed >= 0.5 && speed <= 2.0) {
@@ -231,8 +243,39 @@ function onCloseClick(e) {
 
 function onVoiceChange(e) {
     const voice = e.target.value;
-    chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'SWITCH_VOICE', voice });
-    chrome.storage.local.set({ voice }).catch(() => {});
+    console.log('[widget] onVoiceChange fired — voice:', voice);
+    const rawName = voice.split('_')[1] ?? voice;
+    const displayName = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+    chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'SWITCH_VOICE', voice })
+        .then(() => console.log('[widget] WIDGET_ACTION SWITCH_VOICE sent OK'))
+        .catch((err) => console.error('[widget] WIDGET_ACTION SWITCH_VOICE send FAILED:', err));
+    chrome.storage.local.set({ voice })
+        .then(() => console.log('[widget] voice saved to storage:', voice))
+        .catch((err) => console.error('[widget] storage save FAILED:', err));
+    // Verify storage write by reading it back
+    chrome.storage.local.get(['voice']).then((r) => console.log('[widget] storage verify read-back:', r.voice));
+    showVoiceNotification(displayName);
+}
+
+function showVoiceNotification(voiceName) {
+    if (!voiceSelectEl) return;
+    // Clear any previous notification
+    clearTimeout(voiceNotifyTimeout);
+    const prev = voiceSelectEl.parentNode.querySelector('.tts-voice-notify');
+    if (prev) prev.remove();
+
+    // Hide the select, show notification in its place
+    voiceSelectEl.style.display = 'none';
+    const notify = document.createElement('span');
+    notify.className = 'tts-voice-notify';
+    notify.textContent = `✓ ${voiceName} – next`;
+    voiceSelectEl.parentNode.insertBefore(notify, voiceSelectEl.nextSibling);
+
+    // Restore select after 2 seconds
+    voiceNotifyTimeout = setTimeout(() => {
+        notify.remove();
+        voiceSelectEl.style.display = '';
+    }, 2000);
 }
 
 function onSpeedChange(e) {

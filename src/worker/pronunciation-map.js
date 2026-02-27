@@ -48,6 +48,8 @@ const RAW_ENTRIES = [
     { from: 'i.e.',         to: 'ie' },
     { from: ' vs.',         to: ' versus' },
     { from: '(vs.',         to: '(versus' },
+    { from: ' AI',          to: 'A I'},
+    { from: 'e.g.',          to: 'eg'},
 ];
 
 // ── Pre-compilation ──────────────────────────────────────────────────────────

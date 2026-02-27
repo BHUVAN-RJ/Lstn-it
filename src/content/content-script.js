@@ -80,7 +80,9 @@ function extractPageText() {
     }
 
     const sentences = splitSentences(rawText);
-    const validSentences = sentences.filter((s) => countWords(s.text) >= 2);
+    // Allow single-word sentences (e.g. section headings like "Upwind", "Ambition")
+    // but reject truly empty or single-character fragments (".") that slip through.
+    const validSentences = sentences.filter((s) => s.text.trim().length > 1 && countWords(s.text) >= 1);
 
     if (validSentences.length === 0) {
         return { success: false, error: 'NO_TEXT_FOUND' };
