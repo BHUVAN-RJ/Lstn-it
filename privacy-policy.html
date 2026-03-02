@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AudiTex — Privacy Policy</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #0f0f0f;
+            color: #f0f0f0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.7;
+            padding: 60px 24px 100px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 680px;
+        }
+
+        .badge {
+            display: inline-block;
+            background: rgba(250, 128, 114, 0.15);
+            border: 1px solid rgba(250, 128, 114, 0.4);
+            color: #FA8072;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            padding: 4px 12px;
+            border-radius: 999px;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            margin-bottom: 8px;
+        }
+
+        .meta {
+            font-size: 13px;
+            color: #555;
+            margin-bottom: 48px;
+        }
+
+        h2 {
+            font-size: 14px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #FA8072;
+            margin-bottom: 10px;
+            margin-top: 40px;
+        }
+
+        p {
+            font-size: 15px;
+            color: #bbb;
+            margin-bottom: 16px;
+        }
+
+        ul {
+            list-style: none;
+            margin-bottom: 16px;
+        }
+
+        ul li {
+            font-size: 15px;
+            color: #bbb;
+            padding: 6px 0;
+            padding-left: 20px;
+            position: relative;
+        }
+
+        ul li::before {
+            content: '—';
+            position: absolute;
+            left: 0;
+            color: #FA8072;
+        }
+
+        .highlight-box {
+            background: rgba(250, 128, 114, 0.08);
+            border-left: 3px solid #FA8072;
+            border-radius: 4px;
+            padding: 16px 20px;
+            margin-bottom: 16px;
+        }
+
+        .highlight-box p {
+            margin: 0;
+            color: #f0f0f0;
+        }
+
+        hr {
+            border: none;
+            border-top: 1px solid #222;
+            margin: 48px 0;
+        }
+
+        .footer {
+            margin-top: 60px;
+            font-size: 12px;
+            color: #444;
+            text-align: center;
+        }
+
+        a {
+            color: #FA8072;
+            text-decoration: none;
+        }
+
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+
+        <div class="badge">Privacy Policy</div>
+        <h1>AudiTex</h1>
+        <p class="meta">Last updated: March 2026 &nbsp;&middot;&nbsp; Developed by <a href="https://bhuvanrj.me/portfolio/" target="_blank" rel="noopener">RJ45</a></p>
+
+        <div class="highlight-box">
+            <p>AudiTex is designed to be fully private. Your text never leaves your device. There is no server, no account, and no data collection.</p>
+        </div>
+
+        <h2>What we collect</h2>
+        <p>AudiTex does not collect, transmit, or store any personal data. Specifically:</p>
+        <ul>
+            <li>No browsing history</li>
+            <li>No personal identifiable information</li>
+            <li>No usage analytics or telemetry</li>
+            <li>No account or sign-in required</li>
+        </ul>
+
+        <h2>How page content is used</h2>
+        <p>When you activate AudiTex on a webpage, the extension reads the visible text on that page to convert it to speech. This text is:</p>
+        <ul>
+            <li>Processed entirely on your device</li>
+            <li>Never sent to any external server</li>
+            <li>Never stored beyond your current session (except audio cached locally in your browser for faster repeat playback)</li>
+        </ul>
+
+        <h2>Local storage</h2>
+        <p>AudiTex stores the following data locally in your browser only:</p>
+        <ul>
+            <li><strong style="color: #f0f0f0;">Preferences</strong> — your chosen voice and playback speed</li>
+            <li><strong style="color: #f0f0f0;">Audio cache</strong> — generated audio saved in IndexedDB so articles don't need to be re-processed on repeat visits</li>
+            <li><strong style="color: #f0f0f0;">AI model</strong> — the Kokoro TTS model (~310 MB) downloaded once from Hugging Face and stored in your browser's private file system (OPFS)</li>
+        </ul>
+        <p>All of this data lives entirely on your device and can be cleared at any time by removing the extension.</p>
+
+        <h2>Third-party services</h2>
+        <p>On first use, AudiTex downloads the AI model from <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a>. This is a one-way download of a static file — no personal data is included in the request. After the initial download, the extension operates fully offline.</p>
+
+        <h2>Data sharing</h2>
+        <p>We do not sell, share, or transfer any data to third parties — because we don't collect any data to begin with.</p>
+
+        <h2>Children's privacy</h2>
+        <p>AudiTex does not knowingly collect any information from anyone, including children under the age of 13.</p>
+
+        <h2>Changes to this policy</h2>
+        <p>If this policy is updated, the "Last updated" date at the top of this page will reflect the change. Continued use of the extension after any changes constitutes acceptance of the updated policy.</p>
+
+        <h2>Contact</h2>
+        <p>If you have any questions about this privacy policy, you can reach out via <a href="https://bhuvanrj.me/portfolio/" target="_blank" rel="noopener">bhuvanrj.me</a>.</p>
+
+        <hr>
+
+        <div class="footer">
+            &copy; 2026 AudiTex &nbsp;&middot;&nbsp; Developed by <a href="https://bhuvanrj.me/portfolio/" target="_blank" rel="noopener">RJ45</a>
+        </div>
+
+    </div>
+</body>
+</html>
