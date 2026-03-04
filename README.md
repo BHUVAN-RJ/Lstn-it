@@ -1,6 +1,6 @@
 # Auditex(Previously Lstn-it)
 
-[Chrome-WebStore Link](https://chromewebstore.google.com/detail/auditex/ikiaabefahnnfjninfhfeolbgkfnldpa): 
+[Available on the Chrome Web Store](https://chromewebstore.google.com/detail/auditex/ikiaabefahnnfjninfhfeolbgkfnldpa) 
 
  Transform online articles into natural-sounding audio podcasts using Kokoro-tts, with subtle emotional inflection and customizable playback speeds.
  IMPORTANT UPDATE: To prioritize accessibility and ease of use, I'm evolving my initial open-source idea into a Chrome Extension. The project remains contribution-driven to enhance web accessibility. Currently, the project is in alpha test and is expected to hit Beta by December 28, 2025
