@@ -10,18 +10,56 @@ import { tokenize } from './tokenizer.js';
 import { applyPronunciationMap } from './pronunciation-map.js';
 
 // ── ort environment — set at module level, before InferenceSession.create() ──
+// numThreads must stay at 1 in Chrome extension workers — ORT Web's threading
+// spawns sub-workers via blob: URLs which Chrome blocks in extension contexts.
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let session = null;       // ort.InferenceSession
-let voiceData = null;     // Float32Array (510 × 256) for the active voice
-let activeVoice = null;   // e.g. 'af_heart'
-let voiceBaseUrl = null;  // set from LOAD_MODEL payload
+let session = null;           // ort.InferenceSession
+let voiceData = null;         // Float32Array (510 × 256) for the active voice
+let activeVoice = null;       // e.g. 'af_heart'
+let voiceBaseUrl = null;      // local fallback URL (extension bundle, dev only)
+let remoteVoiceBaseUrl = null; // Hugging Face base URL for voice .bin files
+
+// ── OPFS (Origin Private File System) — persistent model/voice cache ──────────
+// Downloaded files are stored here so they survive extension restarts without
+// re-downloading. OPFS is available in dedicated Web Workers from extension pages.
+
+async function opfsFileExists(filename) {
+    try {
+        const root = await navigator.storage.getDirectory();
+        await root.getFileHandle(filename);
+        return true;
+    } catch { return false; }
+}
+
+async function loadFromOpfs(filename) {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(filename);
+    const file = await handle.getFile();
+    return file.arrayBuffer();
+}
+
+async function saveToOpfs(filename, buffer) {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(filename, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(buffer);
+    await writable.close();
+}
+
+async function deleteFromOpfs(filename) {
+    try {
+        const root = await navigator.storage.getDirectory();
+        await root.removeEntry(filename);
+    } catch { /* not found — ignore */ }
+}
 
 // Detected at session creation time — varies between model export versions
 let inputIdsName  = 'input_ids'; // 'input_ids' (v1.0+) or 'tokens' (older)
 let audioOutName  = 'audio';     // first output name
+let modelHasSpeed = false;       // true if the ONNX model has a 'speed' input
 
 // Cancellation: incremented by CANCEL message or start of each new generateAudio.
 // A running generation captures `myId = cancelId` at start; if cancelId !== myId
@@ -237,31 +275,72 @@ async function phonemizeSentence(text) {
 
 // ── Model loading ──────────────────────────────────────────────────────────────
 
-async function loadModel({ voice, wasmPaths, modelUrl, voiceBaseUrl: vbu }) {
-    voiceBaseUrl = vbu;
+const OPFS_MODEL_FILE = 'kokoro-v1.0.onnx';
+
+async function loadModel({ voice, wasmPaths, modelUrl, voiceBaseUrl: vbu, remoteModelUrl, remoteVoiceBaseUrl: rvbu }) {
+    voiceBaseUrl       = vbu  || '';
+    remoteVoiceBaseUrl = rvbu || '';
 
     post({ type: 'LOADING_PROGRESS', stage: 'wasm', pct: 0 });
     ort.env.wasm.wasmPaths = wasmPaths;
 
-    post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 5 });
-    console.log('[tts-worker] loading model from', modelUrl);
+    // ── 1. Resolve model buffer: OPFS cache → remote download → local bundle ──
+    let modelBuffer;
+    const isCached = await opfsFileExists(OPFS_MODEL_FILE);
 
-    const modelBuffer = await fetchWithProgress(modelUrl, (pct) => {
-        post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 5 + pct * 75 });
-    });
+    if (isCached) {
+        console.log('[tts-worker] model found in OPFS cache — loading locally');
+        post({ type: 'LOADING_PROGRESS', stage: 'model_cached', pct: 5 });
+        modelBuffer = await loadFromOpfs(OPFS_MODEL_FILE);
+        post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 80 });
+    } else {
+        const downloadUrl = remoteModelUrl || modelUrl;
+        console.log('[tts-worker] downloading model from', downloadUrl);
+        post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: 0 });
+        modelBuffer = await fetchWithProgress(downloadUrl, (pct) => {
+            post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: Math.round(pct * 78) });
+        });
+        // Persist to OPFS so next launch is instant
+        post({ type: 'LOADING_PROGRESS', stage: 'saving', pct: 78 });
+        console.log('[tts-worker] saving model to OPFS...');
+        try {
+            await saveToOpfs(OPFS_MODEL_FILE, modelBuffer);
+            console.log('[tts-worker] model cached in OPFS');
+        } catch (err) {
+            console.warn('[tts-worker] OPFS save failed (non-fatal):', err);
+        }
+    }
 
+    // ── 2. Create ONNX session (retry once if OPFS file is corrupt) ──
     post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 82 });
-
-    session = await ort.InferenceSession.create(modelBuffer, {
-        executionProviders: ['wasm'],
-    });
+    let onnxSession;
+    try {
+        onnxSession = await ort.InferenceSession.create(modelBuffer, { executionProviders: ['wasm'] });
+    } catch (err) {
+        if (isCached) {
+            // Cached file may be corrupt — delete it and re-download
+            console.warn('[tts-worker] cached model failed to load, re-downloading...', err);
+            await deleteFromOpfs(OPFS_MODEL_FILE);
+            const downloadUrl = remoteModelUrl || modelUrl;
+            post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: 0 });
+            modelBuffer = await fetchWithProgress(downloadUrl, (pct) => {
+                post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: Math.round(pct * 78) });
+            });
+            post({ type: 'LOADING_PROGRESS', stage: 'saving', pct: 78 });
+            await saveToOpfs(OPFS_MODEL_FILE, modelBuffer).catch(() => {});
+            post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 82 });
+            onnxSession = await ort.InferenceSession.create(modelBuffer, { executionProviders: ['wasm'] });
+        } else {
+            throw err;
+        }
+    }
+    session = onnxSession;
 
     // Detect input/output names — differs between kokoro-onnx export versions
-    inputIdsName = session.inputNames.includes('input_ids') ? 'input_ids' : 'tokens';
-    audioOutName = session.outputNames[0];
-    console.log('[tts-worker] ONNX session created');
-    console.log('[tts-worker] inputs:', session.inputNames, '→ using', inputIdsName);
-    console.log('[tts-worker] outputs:', session.outputNames, '→ using', audioOutName);
+    inputIdsName  = session.inputNames.includes('input_ids') ? 'input_ids' : 'tokens';
+    audioOutName  = session.outputNames[0];
+    modelHasSpeed = session.inputNames.includes('speed');
+    console.log('[tts-worker] ONNX session created, inputs:', session.inputNames.join(', '));
 
     post({ type: 'LOADING_PROGRESS', stage: 'voice', pct: 85 });
     await loadVoice(voice);
@@ -272,14 +351,22 @@ async function loadModel({ voice, wasmPaths, modelUrl, voiceBaseUrl: vbu }) {
 }
 
 async function loadVoice(voiceName) {
-    const url = voiceBaseUrl + voiceName + '.bin';
-    console.log('[tts-worker] loading voice', voiceName, 'from', url);
+    const opfsFile = `voice_${voiceName}.bin`;
 
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Voice file not found: ${voiceName} (${response.status})`);
-
-    const buffer = await response.arrayBuffer();
-    voiceData = new Float32Array(buffer);
+    if (await opfsFileExists(opfsFile)) {
+        console.log('[tts-worker] loading voice', voiceName, 'from OPFS cache');
+        const buffer = await loadFromOpfs(opfsFile);
+        voiceData = new Float32Array(buffer);
+    } else {
+        const url = (remoteVoiceBaseUrl || voiceBaseUrl) + voiceName + '.bin';
+        console.log('[tts-worker] downloading voice', voiceName, 'from', url);
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Voice file not found: ${voiceName} (${response.status})`);
+        const buffer = await response.arrayBuffer();
+        // Cache to OPFS (fire-and-forget — don't block playback on the save)
+        saveToOpfs(opfsFile, buffer).catch(err => console.warn('[tts-worker] voice OPFS save failed:', err));
+        voiceData = new Float32Array(buffer);
+    }
     activeVoice = voiceName;
 
     if (voiceData.length !== 510 * 256) {
@@ -330,7 +417,7 @@ async function fetchWithProgress(url, onProgress) {
  * @param {number}   speed    - Playback speed multiplier (1.0 = normal)
  * @returns {Float32Array|null}  Raw audio samples at 24 kHz, or null on error
  */
-async function runInference(tokenIds, speed = 1.0) {
+async function runInference(tokenIds) {
     if (!session || !voiceData) {
         postError('MODEL_NOT_READY', 'Model has not been loaded yet.');
         return null;
@@ -343,8 +430,12 @@ async function runInference(tokenIds, speed = 1.0) {
             BigInt64Array.from(tokenIds.map(BigInt)),
             [1, tokenIds.length]),
         style: new ort.Tensor('float32', styleVector, [1, 256]),
-        speed: new ort.Tensor('float32', new Float32Array([speed]), [1]),
     };
+    // Speed is handled via WSOLA in scheduleChunk (offscreen.js) rather than
+    // the model's speed param — WSOLA is pitch-preserving and always available.
+    if (modelHasSpeed) {
+        feeds.speed = new ort.Tensor('float32', new Float32Array([1.0]), [1]);
+    }
 
     const results = await session.run(feeds);
     const output = results[audioOutName];
@@ -372,7 +463,7 @@ async function runInference(tokenIds, speed = 1.0) {
  * @param {number} speed
  * @param {number} genId  - opaque ID echoed back in every AUDIO_CHUNK / GENERATION_DONE
  */
-async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0 }) {
+async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, indexOffset = 0 }) {
     if (!session || !voiceData) {
         postError('MODEL_NOT_READY', 'Load the model first.');
         return;
@@ -397,7 +488,7 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0 }
         console.log('[tts-worker] generateAudio: voice loaded, activeVoice =', activeVoice);
     }
 
-    const total = sentences.length;
+    const total = indexOffset + sentences.length; // global total including already-generated sentences
 
     for (let i = 0; i < sentences.length; i++) {
         // Yield to the macrotask queue so that queued SWITCH_VOICE messages
@@ -494,7 +585,7 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0 }
                 }
 
                 // 5. Infer
-                const samples = await runInference(tokenIds, speed);
+                const samples = await runInference(tokenIds);
                 if (cancelId !== myId) return;
                 if (!samples) continue;
 
@@ -515,7 +606,7 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0 }
                 post(
                     {
                         type: 'AUDIO_CHUNK',
-                        index: i,
+                        index: indexOffset + i, // global sentence index
                         total,
                         samples: samplesCopy,
                         sampleRate: 24000,

@@ -9,6 +9,8 @@ const ICON_PLAY = `<svg viewBox="0 0 24 24" class="tts-circle-icon"><path d="M8 
 const ICON_PAUSE = `<svg viewBox="0 0 24 24" class="tts-circle-icon"><path d="M6 19h4V5H6zm8-14v14h4V5z"/></svg>`;
 const ICON_LOADING = `<svg viewBox="0 0 24 24" class="tts-circle-icon"><path d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2z" fill="#fff" opacity="0.5"/></svg>`;
 const ICON_CLOSE = `<svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>`;
+const ICON_DOWNLOAD = `<svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>`;
+const ICON_HOURGLASS = `<svg viewBox="0 0 24 24"><path d="M6 2v6l3.5 3.5L6 15.5V22h12v-6.5L14.5 12 18 8.5V2H6zm10 13.17V20H8v-4.83l4-4 4 4zM8 7.83V4h8v3.83l-4 4-4-4z"/></svg>`;
 const ICON_DONE = `<svg viewBox="0 0 24 24" class="tts-circle-icon"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/></svg>`;
 
 // ── Voice list ──────────────────────────────────────────────────────────────
@@ -28,9 +30,15 @@ const VOICE_GROUPS = {
 
 let widgetEl = null;
 let circleBtn = null;
+let downloadBtn = null;
 let shadowRoot = null;
 let hostEl = null;  // shadow host element (for dragging)
 let currentState = 'loading'; // loading | playing | paused | done | stopped
+let isFirstPlay = true; // true until audio has played at least once
+
+// Download state
+let generationDone = false;
+let pendingDownload = false;
 
 // Seeker state
 let seekerSlider = null;
@@ -71,16 +79,38 @@ export function createWidget(shadow, shadowHost) {
     radial.className = 'tts-radial';
     widgetEl.appendChild(radial);
 
-    // ── Close button (12 o'clock — top) ─────────────────────────────────────
-    const closeItem = document.createElement('div');
-    closeItem.className = 'tts-radial-item pos-top';
+    // ── Close + Download (12 o'clock — top, two circles side by side) ────────
+    const topItem = document.createElement('div');
+    topItem.className = 'tts-radial-item pos-top';
+    const topControls = document.createElement('div');
+    topControls.className = 'tts-top-controls';
+
     const closeBtn = document.createElement('button');
     closeBtn.className = 'tts-close-btn';
     closeBtn.innerHTML = ICON_CLOSE;
     closeBtn.title = 'Stop & close';
     closeBtn.addEventListener('click', onCloseClick);
-    closeItem.appendChild(closeBtn);
-    radial.appendChild(closeItem);
+    topControls.appendChild(closeBtn);
+
+    downloadBtn = document.createElement('button');
+    downloadBtn.className = 'tts-download-circle-btn';
+    downloadBtn.innerHTML = ICON_DOWNLOAD;
+    downloadBtn.title = 'Download audio as WAV';
+    downloadBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (generationDone) {
+            chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'REQUEST_DOWNLOAD' });
+        } else {
+            pendingDownload = true;
+            downloadBtn.classList.add('queued');
+            downloadBtn.innerHTML = ICON_HOURGLASS;
+            downloadBtn.title = 'Will download once generation is complete';
+        }
+    });
+    topControls.appendChild(downloadBtn);
+
+    topItem.appendChild(topControls);
+    radial.appendChild(topItem);
 
     // ── Speed control (9 o'clock — left) ─────────────────────────────────────
     const speedItem = document.createElement('div');
@@ -232,12 +262,22 @@ function formatTime(s) {
 function onCircleClick() {
     if (dragMoved) { dragMoved = false; return; } // Ignore click after drag
     if (currentState === 'loading') return;
+
+    // First play from staged mode: show 1s loading warmup before starting audio
+    if (currentState === 'paused' && isFirstPlay) {
+        updateState('loading');
+        setTimeout(() => {
+            chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'TOGGLE_PLAY_PAUSE' });
+        }, 1000);
+        return;
+    }
+
     chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'TOGGLE_PLAY_PAUSE' });
 }
 
 function onCloseClick(e) {
     e.stopPropagation();
-    chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'STOP' });
+    chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'CLOSE_WIDGET' });
     hideWidget();
 }
 
@@ -302,7 +342,7 @@ function onSeekChange(e) {
 function updateSeekerFill(current, total) {
     if (!seekerSlider) return;
     const pct = total > 0 ? Math.min((current / total) * 100, 100) : 0;
-    seekerSlider.style.background = `linear-gradient(to right, #6366f1 ${pct}%, #4a4a6a ${pct}%)`;
+    seekerSlider.style.background = `linear-gradient(to right, #FA8072 ${pct}%, #4a4a6a ${pct}%)`;
 }
 
 // ── Drag support ────────────────────────────────────────────────────────
@@ -392,7 +432,9 @@ export function showWidget() {
 }
 
 export function hideWidget() {
-    if (widgetEl) widgetEl.classList.add('hidden');
+    if (!widgetEl) return;
+    onDragEnd(); // clean up any in-progress drag listeners
+    widgetEl.classList.add('hidden');
 }
 
 export function updateState(state) {
@@ -406,8 +448,17 @@ export function updateState(state) {
             circleBtn.classList.add('loading');
             circleBtn.innerHTML = ICON_LOADING;
             circleBtn.title = 'Loading...';
+            // Reset download state for new generation
+            generationDone = false;
+            pendingDownload = false;
+            if (downloadBtn) {
+                downloadBtn.classList.remove('queued');
+                downloadBtn.innerHTML = ICON_DOWNLOAD;
+                downloadBtn.title = 'Download audio as WAV';
+            }
             break;
         case 'playing':
+            isFirstPlay = false;
             circleBtn.classList.add('playing');
             circleBtn.innerHTML = ICON_PAUSE;
             circleBtn.title = 'Click to pause';
@@ -441,4 +492,17 @@ export function updateSeeker(current, total) {
     seekerSlider.value = current.toFixed(1);
     if (seekerTime) seekerTime.textContent = formatTime(current);
     updateSeekerFill(current, total);
+}
+
+export function markGenerationDone() {
+    generationDone = true;
+    if (downloadBtn) {
+        downloadBtn.classList.remove('queued');
+        downloadBtn.innerHTML = ICON_DOWNLOAD;
+        downloadBtn.title = 'Download audio as WAV';
+    }
+    if (pendingDownload) {
+        pendingDownload = false;
+        chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'REQUEST_DOWNLOAD' });
+    }
 }

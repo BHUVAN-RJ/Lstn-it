@@ -52,6 +52,9 @@ function _walk(node, parts) {
     const testId = node.getAttribute('data-testid');
     if (testId === 'storyReadTime' || testId === 'storyPublishDate' || testId === 'authorName') return;
 
+    // Skip paulgraham.com YC advertisement cell: <td bgcolor="#ff9922">
+    if (tag === 'td' && node.getAttribute('bgcolor') === '#ff9922') return;
+
     // <br> → single newline (treated as a soft paragraph break)
     if (tag === 'br') { parts.push('\n'); return; }
 
@@ -167,6 +170,15 @@ export function cleanText(rawText) {
     text = collapseWhitespace(text);
     text = stripFootnoteMarkers(text);
     return text;
+}
+
+/**
+ * Strip paulgraham.com-specific footer content.
+ * Call only when window.location.hostname includes 'paulgraham.com'.
+ * Removes the YC advertisement line that appears at the start of some essays.
+ */
+export function stripPaulGrahamContent(text) {
+    return text.replace(/Want to start a startup\? Get funded by Y Combinator\.\s*/g, '');
 }
 
 export { isValidText };

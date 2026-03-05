@@ -2,12 +2,19 @@
 
 import { extractTextFromElement, cleanText, isValidText } from '../utils/text-cleaner.js';
 import { splitSentences } from '../utils/sentence-splitter.js';
-import { createWidget, showWidget, hideWidget, updateState, updateStatus, updateSeeker } from '../widget/widget.js';
+import { createWidget, showWidget, hideWidget, updateState, updateStatus, updateSeeker, markGenerationDone } from '../widget/widget.js';
 import { prepareHighlighter, highlightSentence, clearHighlight } from '../utils/highlight-injector.js';
 
 // ── Widget injection ────────────────────────────────────────────────────────
 
-let widgetInjected = false;
+let widgetInjected  = false;
+let chunksReady     = false; // set when CHUNKS_READY received; guards against SHOW_WIDGET/PLAYBACK_STATE reverting to spinner
+let widgetState     = 'loading'; // mirrors the widget's current visual state
+
+function setWidgetState(state) {
+    widgetState = state;
+    updateState(state);
+}
 
 function injectWidget() {
     if (widgetInjected) return;
@@ -71,7 +78,42 @@ function countWords(text) {
     return text.trim().split(/\s+/).filter(Boolean).length;
 }
 
+function isEditorSite() {
+    const host = location.hostname;
+    return (
+        host.includes('docs.google.com') ||
+        host.includes('sheets.google.com') ||
+        host.includes('slides.google.com') ||
+        host.includes('notion.so') ||
+        host.includes('notion.site') ||
+        host.includes('atlassian.net') ||
+        host.endsWith('.confluence.com') ||
+        host.includes('coda.io') ||
+        host.includes('craft.do') ||
+        host.includes('roamresearch.com') ||
+        host.includes('obsidian.md')
+    );
+}
+
+function extractFromInnerText() {
+    const rawText = (document.body.innerText || '').trim();
+    if (!rawText) return { success: false, error: 'NO_TEXT_FOUND' };
+    const sentences = splitSentences(rawText);
+    const validSentences = sentences.filter(s => s.text.trim().length > 1 && countWords(s.text) >= 1);
+    if (validSentences.length === 0) return { success: false, error: 'NO_TEXT_FOUND' };
+    const fullText = validSentences.map(s => s.text).join(' ');
+    return {
+        success: true,
+        text: fullText,
+        sentences: validSentences,
+        wordCount: countWords(fullText),
+        title: document.title || '',
+        rootEl: null, // no DOM highlighting for editor sites
+    };
+}
+
 function extractPageText() {
+    if (isEditorSite()) return extractFromInnerText();
     const rootEl = findArticleElement();
     const rawText = extractTextFromElement(rootEl);
 
@@ -126,19 +168,50 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             console.log('[content-script] SHOW_WIDGET received, initialState:', message.initialState);
             injectWidget();
             showWidget();
-            if (message.initialState) updateState(message.initialState);
+            if (message.initialState) {
+                // If chunks are already ready, don't revert a 'paused' widget back to 'loading'.
+                // This guards against a race where SHOW_WIDGET(loading) arrives after CHUNKS_READY.
+                const effectiveState = (chunksReady && message.initialState === 'loading') ? 'paused' : message.initialState;
+                setWidgetState(effectiveState);
+            }
+            return false;
+        }
+
+        // ── Highlight-only extraction for cache reload ───────────────────
+        case 'EXTRACT_FOR_HIGHLIGHT': {
+            console.log('[content-script] EXTRACT_FOR_HIGHLIGHT — preparing highlighter without re-sending to offscreen');
+            try {
+                const result = extractPageText();
+                if (result.success) {
+                    if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
+                    console.log('[content-script] EXTRACT_FOR_HIGHLIGHT: highlighter ready');
+                }
+            } catch (err) {
+                console.error('[content-script] EXTRACT_FOR_HIGHLIGHT error:', err);
+            }
+            return false;
+        }
+
+        case 'DOWNLOAD_READY': {
+            markGenerationDone();
             return false;
         }
 
         case 'CHUNKS_READY': {
             console.log('[content-script] CHUNKS_READY — switching widget to paused/play state');
-            updateState('paused');
-            updateStatus('Ready — click to play');
+            chunksReady = true;
+            // Don't overwrite 'playing' with 'paused' — happens when RESTORE_SESSION
+            // auto-plays and CHUNKS_READY arrives after PLAYBACK_STATE:'playing'.
+            if (widgetState !== 'playing') {
+                setWidgetState('paused');
+                updateStatus('Ready — click to play');
+            }
             return false;
         }
 
         // ── Background staging (icon click): extract + generate without auto-play
         case 'EXTRACT_AND_STAGE': {
+            chunksReady = false; // new generation starting — reset guard
             console.log('[content-script] EXTRACT_AND_STAGE — extracting for background generation');
             try {
                 const result = extractPageText();
@@ -150,12 +223,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     `[content-script] extracted ${result.wordCount} words,`,
                     `${result.sentences.length} sentences (staged)`
                 );
-                prepareHighlighter(result.rootEl, result.sentences);
+                if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
                 chrome.runtime.sendMessage({
                     type: 'EXTRACTION_RESULT',
                     sentences: result.sentences,
                     wordCount: result.wordCount,
                     title: result.title,
+                    pageUrl: window.location.href,
                     autoPlay: false,
                 });
             } catch (err) {
@@ -165,6 +239,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'EXTRACT_AND_PLAY': {
+            chunksReady = false; // new generation starting — reset guard
             console.log('[content-script] EXTRACT_AND_PLAY — extracting and sending to offscreen');
             try {
                 const result = extractPageText();
@@ -176,18 +251,37 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     `[content-script] extracted ${result.wordCount} words,`,
                     `${result.sentences.length} sentences`
                 );
-                prepareHighlighter(result.rootEl, result.sentences);
+                if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
                 // Send extraction result to service worker → offscreen
                 chrome.runtime.sendMessage({
                     type: 'EXTRACTION_RESULT',
                     sentences: result.sentences,
                     wordCount: result.wordCount,
                     title: result.title,
+                    pageUrl: window.location.href,
                 });
             } catch (err) {
                 console.error('[content-script] extraction error:', err);
                 updateStatus('Error extracting text.');
             }
+            return false;
+        }
+
+        // ── Selection TTS: split selected text and send as proper sentences ──
+        case 'EXTRACT_SELECTION': {
+            chunksReady = false;
+            const selSentences = splitSentences(message.text);
+            const validSel = selSentences.filter(s => s.text.trim().length > 1 && countWords(s.text) >= 1);
+            if (validSel.length === 0) return false;
+            const selFullText = validSel.map(s => s.text).join(' ');
+            chrome.runtime.sendMessage({
+                type: 'EXTRACTION_RESULT',
+                sentences: validSel,
+                wordCount: countWords(selFullText),
+                title: document.title || '',
+                // autoPlay defaults to true (same as icon-click EXTRACT_AND_PLAY)
+                // No pageUrl — selections don't pollute the page cache
+            });
             return false;
         }
 
@@ -199,10 +293,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         case 'PLAYBACK_STATE': {
             console.log('[content-script] PLAYBACK_STATE:', message.state);
-            updateState(message.state);
-            if (message.state === 'done' || message.state === 'stopped') {
+            // Once chunks are ready, ignore 'loading' state (e.g. from voice switch LOADING_PROGRESS)
+            // to prevent the play button from reverting back to a spinner.
+            if (message.state === 'loading' && chunksReady) {
+                return false;
+            }
+            if (message.state === 'stopped' || message.state === 'done') {
+                chunksReady = false;
                 clearHighlight();
             }
+            setWidgetState(message.state);
             return false;
         }
 
@@ -219,9 +319,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'MODEL_READY': {
+            // Model loaded — generation will start shortly. Do NOT show play button here;
+            // only CHUNKS_READY should transition the widget from loading to paused.
             console.log('[content-script] MODEL_READY received');
-            updateState('paused');
-            updateStatus('Ready — click extension icon to play');
             return false;
         }
 

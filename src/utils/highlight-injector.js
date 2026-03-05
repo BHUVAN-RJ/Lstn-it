@@ -83,6 +83,8 @@ function collectBufferEntries(rootEl) {
         // the buffer stays in sync with the extracted sentence text.
         const testId = node.getAttribute('data-testid');
         if (testId === 'storyReadTime' || testId === 'storyPublishDate' || testId === 'authorName') return;
+        // Skip paulgraham.com YC advertisement cell — mirrors text-cleaner._walk
+        if (tag === 'td' && node.getAttribute('bgcolor') === '#ff9922') return;
         if (tag === 'br') { entries.push({ type: 'br' }); return; }
         const isBlock = BLOCK_TAGS.has(tag);
         if (isBlock) entries.push({ type: 'block' });
@@ -196,11 +198,11 @@ const OVERLAY_CSS = `
     position: fixed;
     pointer-events: none;
     border-radius: 5px;
-    background: rgba(14, 165, 233, 0.07);
-    border: 1.5px solid rgba(14, 165, 233, 0.5);
+    background: rgba(250, 128, 114, 0.15);
+    border: 1.5px solid rgba(250, 128, 114, 0.75);
     box-shadow:
-        0 0 0 3px rgba(14, 165, 233, 0.07),
-        0 2px 18px rgba(14, 165, 233, 0.18);
+        0 0 0 3px rgba(250, 128, 114, 0.12),
+        0 2px 22px rgba(250, 128, 114, 0.35);
     opacity: 0;
     transition: ${TRANSITION_ON};
 }

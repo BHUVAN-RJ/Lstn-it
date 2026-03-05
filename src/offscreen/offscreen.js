@@ -2,6 +2,13 @@
 // Lives in a Chrome offscreen document; persists independently of any popup.
 
 import { stretchAudio } from '../utils/audio-stretcher.js';
+import { encodeToOpus } from './opus-encoder.js';
+import {
+    saveToCache, loadFromCache, checkCacheExists, clearExpired, normUrl,
+    appendChunk, loadChunks, clearChunks,
+    savePosition, loadPosition, deletePosition,
+    saveGenerationJob, loadGenerationJob, deleteGenerationJob,
+} from './audio-cache.js';
 
 // ── Send state updates to service worker (which relays to content script widget) ──
 function notifySW(message) {
@@ -25,6 +32,7 @@ let generationDone         = false;
 
 const PREBUFFER_COUNT = 3;
 let pendingChunks = [];
+let chunksReadySent = false; // prevents re-sending 'loading' state after CHUNKS_READY in staged mode
 
 let currentGenId = 0;
 
@@ -34,6 +42,15 @@ const SLOW_RATE      = 0.9;
 
 let currentUserSpeed = 1.0;
 let chunksAhead = 0;
+let pausedAtTime = 0; // elapsed seconds at the moment the user paused; used for rebuild-on-resume
+let scheduledHighlightTimeouts = []; // IDs of pending SENTENCE_PLAYING setTimeout calls
+
+// Incremental chunk save counter — monotonically increasing index per session
+let chunkSaveIndex = 0;
+// Highest sentence index fully generated this session (used to determine resume point)
+let lastSentenceGenerated = -1;
+// Deferred generation resume — queued while model is still loading after an offscreen restart
+let pendingResume = null;
 
 // Pause durations (seconds)
 const PAUSE_SECTION   = 1.20;
@@ -41,8 +58,8 @@ const PAUSE_PARAGRAPH = 0.60;
 const PAUSE_SENTENCE  = 0.25;
 
 // WAV export
-let allSamples  = [];
 let articleTitle = '';
+let currentPageUrl = null; // set from EXTRACTION_RESULT.pageUrl; used for cache key
 
 // ── Audio history for seeking ────────────────────────────────────────────────
 // Each entry: { relStart, duration, data, sampleRate, countAsChunk, sentenceIndex, pauseAfter }
@@ -62,13 +79,26 @@ const PROGRESS_THROTTLE_MS = 500;
 
 // ── Audio playback ──────────────────────────────────────────────────────────
 
-function resetAudio() {
+function resetAudio(prevUrl) {
     console.log('[offscreen] resetAudio()');
     stopProgressTracking();
+    clearHighlightTimeouts();
+    // Clear previous session data from IndexedDB
+    if (prevUrl) {
+        clearChunks(prevUrl).catch(() => {});
+        deletePosition(prevUrl).catch(() => {});
+        deleteGenerationJob(prevUrl).catch(() => {});
+    }
     if (audioContext) {
         try { audioContext.close(); } catch (_) {}
     }
-    audioContext           = new AudioContext({ sampleRate: 24000 });
+    try {
+        audioContext = new AudioContext({ sampleRate: 24000 });
+    } catch (err) {
+        console.error('[offscreen] AudioContext creation failed:', err);
+        notifySW({ type: 'ERROR', code: 'AUDIO_CONTEXT_FAILED', detail: err.message });
+        return;
+    }
     nextPlayTime           = 0;
     firstChunkStartTime    = 0;
     totalScheduledDuration = 0;
@@ -77,9 +107,14 @@ function resetAudio() {
     chunksAhead            = 0;
     isPlaying              = false;
     generationDone         = false;
-    allSamples             = [];
+    pausedAtTime           = 0;
+    chunkSaveIndex         = 0;
+    lastSentenceGenerated  = -1;
+    pendingResume          = null;
     audioHistory           = [];
     historyTotalDuration   = 0;
+    chunksReadySent        = false;
+    currentPageUrl         = null;
     console.log('[offscreen] AudioContext created, state:', audioContext.state);
     // Offscreen documents may start suspended — force resume
     if (audioContext.state === 'suspended') {
@@ -96,21 +131,25 @@ function resetAudio() {
 function scheduleChunk(chunk, slowMode = false) {
     const { samples, sampleRate, endsWithParagraph, endsWithSection, isMidChunk, countAsChunk, sentenceIndex, pauseAfterMs } = chunk;
 
-    const effectiveSpeed   = slowMode ? SLOW_RATE : 1.0;
+    // Combine user speed with adaptive slowdown.
+    // currentUserSpeed (0.5–2.0) is the user-facing rate from the speed slider.
+    // slowMode multiplies by SLOW_RATE (0.9) to buy inference time when the buffer runs thin.
+    const effectiveSpeed   = currentUserSpeed * (slowMode ? SLOW_RATE : 1.0);
     const stretchedSamples = stretchAudio(samples, effectiveSpeed);
-
-    allSamples.push(new Float32Array(samples));
 
     if (nextPlayTime < audioContext.currentTime) {
         nextPlayTime = audioContext.currentTime + 0.02;
     }
 
-    // Fire SENTENCE_PLAYING exactly when this chunk's audio begins (not for overflow tails)
+    // Fire SENTENCE_PLAYING exactly when this chunk's audio begins (not for overflow tails).
+    // Track the timeout ID so it can be cancelled on pause or seek.
     if (!isMidChunk && sentenceIndex !== undefined) {
         const delayMs = Math.max(0, (nextPlayTime - audioContext.currentTime) * 1000);
-        setTimeout(() => {
+        const tid = setTimeout(() => {
+            scheduledHighlightTimeouts = scheduledHighlightTimeouts.filter(x => x !== tid);
             notifySW({ type: 'SENTENCE_PLAYING', index: sentenceIndex });
         }, delayMs);
+        scheduledHighlightTimeouts.push(tid);
     }
 
     const buffer = audioContext.createBuffer(1, stretchedSamples.length, sampleRate);
@@ -145,15 +184,29 @@ function scheduleChunk(chunk, slowMode = false) {
 
     // Record chunk in audio history for seeking support
     const relStart = firstChunkStartTime > 0 ? (nextPlayTime - firstChunkStartTime) : 0;
-    audioHistory.push({
+    const historyEntry = {
         relStart,
         duration: stretchedSamples.length / sampleRate,
         data: new Float32Array(stretchedSamples), // copy for replay
         sampleRate,
         countAsChunk,
+        isMidChunk,
         sentenceIndex,
         pauseAfter: pause,
-    });
+    };
+    audioHistory.push(historyEntry);
+
+    // Persist chunk to IndexedDB immediately — survives offscreen termination
+    if (currentPageUrl) {
+        const idx = chunkSaveIndex++;
+        const buf = historyEntry.data.buffer.slice(
+            historyEntry.data.byteOffset,
+            historyEntry.data.byteOffset + historyEntry.data.byteLength
+        );
+        appendChunk(currentPageUrl, idx, {
+            data: buf, sampleRate, countAsChunk, sentenceIndex, pauseAfter: pause,
+        }).catch(() => {});
+    }
 
     nextPlayTime           += buffer.duration + pause;
     totalScheduledDuration  = nextPlayTime - firstChunkStartTime;
@@ -187,6 +240,7 @@ function flushPendingChunks() {
         if (autoPlayMode) {
             startPlayback();
         } else {
+            chunksReadySent = true;
             notifySW({ type: 'CHUNKS_READY' });
         }
     }
@@ -200,13 +254,18 @@ function queueAudioChunk(samples, sampleRate, endsWithParagraph, endsWithSection
     if (nextPlayTime === 0) {
         pendingChunks.push(chunk);
         const sentenceCount = pendingChunks.filter((c) => c.countAsChunk).length;
-        notifySW({ type: 'STATUS_UPDATE', text: `Buffering\u2026 (${sentenceCount}/${PREBUFFER_COUNT})` });
-        notifySW({ type: 'PLAYBACK_STATE', state: 'loading' });
+
+        // Only send loading-state updates until the play button is shown
+        if (!chunksReadySent) {
+            notifySW({ type: 'STATUS_UPDATE', text: `Buffering\u2026 (${sentenceCount}/${PREBUFFER_COUNT})` });
+            notifySW({ type: 'PLAYBACK_STATE', state: 'loading' });
+        }
 
         if (sentenceCount >= PREBUFFER_COUNT) {
             if (autoPlayMode) {
                 startPlayback();
-            } else {
+            } else if (!chunksReadySent) {
+                chunksReadySent = true;
                 notifySW({ type: 'CHUNKS_READY' });
             }
         }
@@ -264,6 +323,7 @@ function onPlaybackComplete() {
 
 function stopPlayback() {
     stopProgressTracking();
+    clearHighlightTimeouts();
     for (const src of scheduledSources) {
         try { src.stop(); } catch (_) {}
     }
@@ -278,19 +338,75 @@ function stopPlayback() {
     notifySW({ type: 'PROGRESS_UPDATE', pct: 0 });
 }
 
+// ── Highlight sync helpers ────────────────────────────────────────────────────
+
+/** Cancel all pending SENTENCE_PLAYING timeouts (called on pause / seek / stop). */
+function clearHighlightTimeouts() {
+    for (const id of scheduledHighlightTimeouts) clearTimeout(id);
+    scheduledHighlightTimeouts = [];
+}
+
+/**
+ * Reschedule SENTENCE_PLAYING timeouts to match the current AudioContext clock.
+ * Called after resume-from-pause or after a seek so the highlighter stays in sync.
+ * Also immediately fires for the sentence at the current playhead position.
+ */
+function rescheduleHighlights() {
+    clearHighlightTimeouts();
+    if (!audioContext || audioHistory.length === 0 || firstChunkStartTime === 0) return;
+
+    const now = audioContext.currentTime;
+    let currentSentence = null;      // highest-relStart sentence that has already started
+    const seenSentences = new Set(); // deduplicates mid-chunk overflow tails
+
+    for (const entry of audioHistory) {
+        if (entry.sentenceIndex === undefined) continue;
+        // isMidChunk: stored on live entries; for IDB-restored entries use seenSentences dedup
+        const isMid = entry.isMidChunk === true;
+        const playAt = firstChunkStartTime + entry.relStart;
+
+        if (playAt <= now) {
+            // Already past — track the most recent sentence for the immediate-fire below
+            if (!isMid) currentSentence = entry.sentenceIndex;
+        } else {
+            // Future — schedule a timeout for the first occurrence of each sentence
+            if (!isMid && !seenSentences.has(entry.sentenceIndex)) {
+                seenSentences.add(entry.sentenceIndex);
+                const delayMs = Math.max(0, (playAt - now) * 1000);
+                const tid = setTimeout(() => {
+                    scheduledHighlightTimeouts = scheduledHighlightTimeouts.filter(x => x !== tid);
+                    notifySW({ type: 'SENTENCE_PLAYING', index: entry.sentenceIndex });
+                }, delayMs);
+                scheduledHighlightTimeouts.push(tid);
+            }
+        }
+    }
+
+    // Immediately highlight the sentence playing right now
+    if (currentSentence !== null) {
+        notifySW({ type: 'SENTENCE_PLAYING', index: currentSentence });
+    }
+}
+
 // ── Seek ─────────────────────────────────────────────────────────────────────
 
 function seekTo(targetTime) {
     if (!audioContext || audioHistory.length === 0) return;
+    // If Chrome force-closed the AudioContext (long inactivity in offscreen doc), create a fresh one
+    if (audioContext.state === 'closed') {
+        console.log('[offscreen] seekTo: AudioContext was closed — creating new one');
+        audioContext = new AudioContext({ sampleRate: 24000 });
+    }
     targetTime = Math.max(0, Math.min(targetTime, historyTotalDuration));
     console.log(`[offscreen] seekTo(${targetTime.toFixed(2)}s) — history: ${audioHistory.length} chunks, total: ${historyTotalDuration.toFixed(2)}s`);
 
-    // Stop all currently scheduled sources
+    // Stop all currently scheduled sources and cancel stale highlight timeouts
     for (const src of scheduledSources) {
         try { src.stop(); } catch (_) {}
     }
     scheduledSources = [];
     chunksAhead = 0;
+    clearHighlightTimeouts();
 
     if (audioContext.state === 'suspended') audioContext.resume();
 
@@ -349,6 +465,7 @@ function seekTo(targetTime) {
         notifySW({ type: 'PLAYBACK_STATE', state: 'playing' });
     }
     startProgressTracking();
+    rescheduleHighlights(); // sync highlighter to new playhead position
 
     console.log(`[offscreen] seekTo: rescheduled ${audioHistory.length - startIdx} chunks after seek point`);
 }
@@ -396,32 +513,56 @@ function writeString(view, offset, string) {
     }
 }
 
-function handleDownloadRequest() {
-    if (allSamples.length === 0) return;
+async function handleDownloadRequest() {
+    const chunks = audioHistory.map(e => e.data);
+    if (chunks.length === 0) return;
 
-    const totalLen = allSamples.reduce((sum, s) => sum + s.length, 0);
+    const totalLen = chunks.reduce((sum, s) => sum + s.length, 0);
     const merged = new Float32Array(totalLen);
     let offset = 0;
-    for (const chunk of allSamples) {
+    for (const chunk of chunks) {
         merged.set(chunk, offset);
         offset += chunk.length;
     }
 
-    const wavBuffer = encodeWAV(merged, 24000);
-    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-    const url = URL.createObjectURL(blob);
     const safeName = articleTitle.replace(/[^a-zA-Z0-9 _-]/g, '').trim().slice(0, 60) || 'audio';
 
-    notifySW({ type: 'DOWNLOAD_AUDIO', url, filename: `${safeName}.wav` });
+    try {
+        console.log(`[offscreen] encoding ${(merged.length / 24000).toFixed(1)}s of audio to Opus…`);
+        const opusBuffer = await encodeToOpus(merged, 24000);
+        const blob = new Blob([opusBuffer], { type: 'audio/ogg; codecs=opus' });
+        const opusUrl = URL.createObjectURL(blob);
+        notifySW({ type: 'DOWNLOAD_AUDIO', url: opusUrl, filename: `${safeName}.ogg` });
+        setTimeout(() => URL.revokeObjectURL(opusUrl), 60000);
+        console.log(`[offscreen] Opus export done — ${(opusBuffer.byteLength / 1024).toFixed(0)} KB`);
+    } catch (err) {
+        // Fallback to WAV if Opus encoding fails (e.g. old Chrome, unsupported codec)
+        console.warn('[offscreen] Opus encoding failed, falling back to WAV:', err.message);
+        const wavBuffer = encodeWAV(merged, 24000);
+        const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+        const wavUrl = URL.createObjectURL(blob);
+        notifySW({ type: 'DOWNLOAD_AUDIO', url: wavUrl, filename: `${safeName}.wav` });
+        setTimeout(() => URL.revokeObjectURL(wavUrl), 60000);
+    }
 }
 
 // ── TTS Worker ──────────────────────────────────────────────────────────────
 
+// ── Remote model hosting (Hugging Face) ──────────────────────────────────────
+// Upload kokoro-v1.0.onnx and the voices/ folder to your HF repo, then set
+// these two URLs. The model is downloaded once on first use and cached in OPFS.
+const HF_REPO           = 'https://huggingface.co/BRJ45/Kokoro-tts-onnx/resolve/main';
+const HF_MODEL_URL      = `${HF_REPO}/kokoro-v1.0.onnx`;
+const HF_VOICE_BASE_URL = `${HF_REPO}/`;
+
 const STAGE_LABELS = {
-    wasm:  'Initialising WASM\u2026',
-    model: 'Loading model\u2026',
-    voice: 'Loading voice\u2026',
-    done:  'Ready',
+    wasm:         'Initialising engine\u2026',
+    downloading:  'Downloading model\u2026 (first run, ~310 MB)',
+    saving:       'Saving model locally\u2026',
+    model_cached: 'Loading model\u2026',
+    model:        'Loading model\u2026',
+    voice:        'Loading voice\u2026',
+    done:         'Ready',
 };
 
 function initWorker(voice) {
@@ -447,6 +588,11 @@ function initWorker(voice) {
                     const queued = pendingExtraction;
                     pendingExtraction = null;
                     startGeneration(queued);
+                } else if (pendingResume) {
+                    // Resume generation after offscreen restart (RESTORE_SESSION queued it)
+                    const resume = pendingResume;
+                    pendingResume = null;
+                    resume();
                 } else {
                     notifySW({ type: 'STATUS_UPDATE', text: 'Ready' });
                 }
@@ -467,6 +613,8 @@ function initWorker(voice) {
                     break;
                 }
                 console.log(`[offscreen] audio chunk ${index + 1}/${total}: ${samples.length} samples (${(samples.length / sampleRate).toFixed(2)}s)${pauseAfterMs !== undefined ? ` +${pauseAfterMs}ms` : ''}`);
+                // Track highest fully-generated sentence index (not mid-chunk overflow tails)
+                if (!isMidChunk && index > lastSentenceGenerated) lastSentenceGenerated = index;
                 queueAudioChunk(samples, sampleRate, endsWithParagraph, endsWithSection, isMidChunk, countAsChunk, index, pauseAfterMs);
                 break;
             }
@@ -477,6 +625,25 @@ function initWorker(voice) {
                 generationDone = true;
                 notifySW({ type: 'GENERATION_DONE' });
                 console.log(`[offscreen] all ${payload.total} sentences generated`);
+                // Save to IndexedDB and notify when done
+                (async () => {
+                    try {
+                        if (currentPageUrl) {
+                            const entries = buildCacheEntries();
+                            if (entries.length > 0) {
+                                await saveToCache(currentPageUrl, { title: articleTitle, entries });
+                                console.log('[offscreen] saved to cache for', currentPageUrl, `(${entries.length} chunks)`);
+                                // Individual chunks + job now redundant — audio store has the full record
+                                clearChunks(currentPageUrl).catch(() => {});
+                                deleteGenerationJob(currentPageUrl).catch(() => {});
+                            }
+                        }
+                    } catch (err) {
+                        console.error('[offscreen] cache save failed:', err);
+                    } finally {
+                        notifySW({ type: 'DOWNLOAD_READY' });
+                    }
+                })();
                 break;
 
             case 'VOICE_READY':
@@ -496,18 +663,67 @@ function initWorker(voice) {
 
     ttsWorker.onerror = (err) => {
         console.error('[offscreen] worker crash:', err.message, '|', err.filename, 'line', err.lineno);
-        notifySW({ type: 'ERROR', code: 'MODEL_LOAD_FAILED', detail: err.message || 'Worker crashed' });
+        notifySW({ type: 'ERROR', code: 'WORKER_CRASHED', detail: err.message || 'Worker crashed' });
+        // Tear down audio + notify widget, then restart the worker so the extension remains usable
+        ttsWorker = null;
+        modelReady = false;
+        stopPlayback();
+        initWorker(currentVoiceName);
+    };
+
+    ttsWorker.onmessageerror = (err) => {
+        console.error('[offscreen] worker message deserialise error:', err);
     };
 
     notifySW({ type: 'STATUS_UPDATE', text: 'Loading model\u2026' });
     notifySW({ type: 'PLAYBACK_STATE', state: 'loading' });
     ttsWorker.postMessage({
-        type:         'LOAD_MODEL',
+        type:               'LOAD_MODEL',
         voice,
-        wasmPaths:    chrome.runtime.getURL('wasm/'),
-        modelUrl:     chrome.runtime.getURL('models/kokoro-v1.0.onnx'),
-        voiceBaseUrl: chrome.runtime.getURL('models/voices/'),
+        wasmPaths:          chrome.runtime.getURL('wasm/'),
+        remoteModelUrl:     HF_MODEL_URL,
+        remoteVoiceBaseUrl: HF_VOICE_BASE_URL,
+        // Local fallbacks (only used if remote URL is missing or during development)
+        modelUrl:           chrome.runtime.getURL('models/kokoro-v1.0.onnx'),
+        voiceBaseUrl:       chrome.runtime.getURL('models/voices/'),
     });
+}
+
+// ── Cache helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Build the array of entries to persist in IndexedDB.
+ * If audio was already played, use audioHistory (has relStart / timing data).
+ * If we're in staged mode (play never clicked), derive from pendingChunks.
+ */
+function buildCacheEntries() {
+    if (audioHistory.length > 0) {
+        return audioHistory.map(e => ({
+            data:         e.data.buffer.slice(e.data.byteOffset, e.data.byteOffset + e.data.byteLength),
+            sampleRate:   e.sampleRate,
+            countAsChunk: e.countAsChunk,
+            sentenceIndex: e.sentenceIndex,
+            pauseAfter:   e.pauseAfter,
+        }));
+    }
+    if (pendingChunks.length > 0) {
+        return pendingChunks.map(chunk => {
+            const pause = chunk.pauseAfterMs !== undefined
+                ? chunk.pauseAfterMs / 1000
+                : chunk.isMidChunk        ? 0
+                : chunk.endsWithSection   ? PAUSE_SECTION
+                : chunk.endsWithParagraph ? PAUSE_PARAGRAPH
+                : PAUSE_SENTENCE;
+            return {
+                data:         chunk.samples.buffer.slice(chunk.samples.byteOffset, chunk.samples.byteOffset + chunk.samples.byteLength),
+                sampleRate:   chunk.sampleRate,
+                countAsChunk: chunk.countAsChunk,
+                sentenceIndex: chunk.sentenceIndex,
+                pauseAfter:   pause,
+            };
+        });
+    }
+    return [];
 }
 
 // ── Start generation from extraction result ─────────────────────────────────
@@ -515,21 +731,32 @@ function initWorker(voice) {
 async function startGeneration(message) {
     console.log('[offscreen] startGeneration() —', message.sentences?.length, 'sentences,', message.wordCount, 'words');
 
-    // Read the latest voice preference directly from storage.
+    // Read the latest voice + speed preferences directly from storage.
     // This is the definitive source of truth — bypasses all messaging paths.
     try {
         if (chrome.storage?.local) {
-            const result = await chrome.storage.local.get(['voice']);
+            const result = await chrome.storage.local.get(['voice', 'speed']);
             if (result.voice) {
                 currentVoiceName = result.voice;
             }
+            if (result.speed != null) {
+                const speed = parseFloat(result.speed);
+                if (speed >= 0.5 && speed <= 2.0) currentUserSpeed = speed;
+            }
         }
     } catch (_) {}
-    console.log('[offscreen] startGeneration voice:', currentVoiceName);
+    console.log('[offscreen] startGeneration voice:', currentVoiceName, 'speed:', currentUserSpeed);
 
     autoPlayMode = message.autoPlay !== false; // default true; EXTRACT_AND_STAGE sets false
-    resetAudio();
-    articleTitle = message.title || '';
+    const prevUrl = currentPageUrl; // save before resetAudio clears it
+    resetAudio(prevUrl);
+    articleTitle   = message.title   || '';
+    currentPageUrl = message.pageUrl || null;
+
+    // Persist sentence list so generation can resume if Chrome kills the offscreen
+    if (currentPageUrl && message.sentences?.length > 0) {
+        saveGenerationJob(currentPageUrl, { sentences: message.sentences, title: articleTitle }).catch(() => {});
+    }
     currentGenId++;
     ttsWorker.postMessage({ type: 'CANCEL' });
     ttsWorker.postMessage({
@@ -564,6 +791,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         case 'TOGGLE_PLAY_PAUSE': {
             if (!audioContext) return false;
+            // Cache-loaded state: audioHistory populated but audio not yet scheduled
+            if (audioHistory.length > 0 && nextPlayTime === 0 && pendingChunks.length === 0) {
+                seekTo(0);
+                return false;
+            }
             // Staged mode: user clicked play for the first time — start playback now
             if (!autoPlayMode && nextPlayTime === 0 && pendingChunks.length > 0) {
                 autoPlayMode = true;
@@ -571,13 +803,28 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                 return false;
             }
             if (audioContext.state === 'running') {
-                audioContext.suspend();
+                pausedAtTime = Math.max(0, audioContext.currentTime - firstChunkStartTime);
+                clearHighlightTimeouts(); // stop spurious highlights during pause
+                audioContext.suspend().catch(() => {});
                 isPlaying = false;
+                // Persist position so it survives offscreen termination
+                if (currentPageUrl) {
+                    savePosition(currentPageUrl, {
+                        position: pausedAtTime,
+                        generationComplete: generationDone,
+                        title: articleTitle,
+                    }).catch(() => {});
+                }
                 notifySW({ type: 'PLAYBACK_STATE', state: 'paused' });
                 notifySW({ type: 'STATUS_UPDATE', text: 'Paused.' });
-            } else if (audioContext.state === 'suspended') {
-                audioContext.resume();
+            } else if (audioContext.state === 'closed') {
+                // AudioContext was killed (e.g. keepalive failed) — rebuild from saved position
+                seekTo(pausedAtTime);
+            } else {
+                // Normal resume — AudioContext was merely suspended, not killed
+                audioContext.resume().catch(() => {});
                 isPlaying = true;
+                rescheduleHighlights(); // restore highlights from pause point
                 notifySW({ type: 'PLAYBACK_STATE', state: 'playing' });
                 notifySW({ type: 'STATUS_UPDATE', text: 'Playing\u2026' });
             }
@@ -602,18 +849,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         case 'WIDGET_ACTION': {
             console.log('[offscreen] WIDGET_ACTION received, action:', message.action, message.action === 'SWITCH_VOICE' ? 'voice: ' + message.voice : '');
             // Content script → offscreen via chrome.runtime.sendMessage is reliable.
-            // Track voice here too in case the SW relay never arrives.
+            // Handle directly here in case the SW relay never arrives.
             if (message.action === 'SWITCH_VOICE') {
                 currentVoiceName = message.voice;
                 if (ttsWorker && modelReady) {
                     ttsWorker.postMessage({ type: 'SWITCH_VOICE', voice: message.voice });
                 }
+            } else if (message.action === 'SET_SPEED') {
+                currentUserSpeed = message.speed;
+                console.log('[offscreen] speed updated via WIDGET_ACTION:', currentUserSpeed);
             }
             return false;
         }
 
         case 'SET_SPEED': {
             currentUserSpeed = message.speed;
+            console.log('[offscreen] SET_SPEED:', currentUserSpeed);
             return false;
         }
 
@@ -627,6 +878,235 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             return false;
         }
 
+        case 'CLOSE_WIDGET': {
+            // Widget is hiding — suspend audio but keep state; persist position to IDB
+            // so that if Chrome terminates the offscreen, state can be restored.
+            if (audioContext && audioContext.state === 'running') {
+                pausedAtTime = Math.max(0, audioContext.currentTime - firstChunkStartTime);
+                audioContext.suspend().catch(() => {});
+                isPlaying = false;
+            }
+            if (currentPageUrl) {
+                savePosition(currentPageUrl, {
+                    position: pausedAtTime,
+                    generationComplete: generationDone,
+                    title: articleTitle,
+                }).catch(() => {});
+            }
+            return false;
+        }
+
+        case 'QUERY_CACHE': {
+            // Service worker asks: is there cached or in-progress audio for this URL?
+            // In-memory state takes priority over IndexedDB so we don't reload live audio —
+            // BUT only if the in-memory audio belongs to the same URL. If the user switched
+            // to a different page, report no in-memory audio so a fresh generation starts.
+            (async () => {
+                const hasAudio = audioHistory.length > 0 || pendingChunks.length > 0;
+                const urlMatches = !message.url || !currentPageUrl ||
+                    normUrl(message.url) === currentPageUrl;
+                if (hasAudio && urlMatches) {
+                    sendResponse({
+                        hit:         false,
+                        hasAudio:    true,
+                        generating:  !generationDone,
+                        chunksReady: chunksReadySent || generationDone,
+                    });
+                    return;
+                }
+                try {
+                    const hit = await checkCacheExists(message.url);
+                    sendResponse({ hit, hasAudio: false, generating: false, chunksReady: false });
+                } catch (_) {
+                    sendResponse({ hit: false, hasAudio: false, generating: false, chunksReady: false });
+                }
+            })();
+            return true; // async sendResponse
+        }
+
+        case 'LOAD_FROM_CACHE': {
+            // Load previously-generated audio from IndexedDB and prepare for playback.
+            (async () => {
+                try {
+                    const cached = await loadFromCache(message.url);
+                    if (!cached || cached.entries.length === 0) {
+                        console.warn('[offscreen] LOAD_FROM_CACHE: cache miss or expired for', message.url);
+                        notifySW({ type: 'CACHE_MISS' });
+                        return;
+                    }
+
+                    // Tear down any existing AudioContext and rebuild
+                    stopProgressTracking();
+                    if (audioContext) { try { audioContext.close(); } catch (_) {} }
+                    audioContext = new AudioContext({ sampleRate: 24000 });
+                    if (audioContext.state === 'suspended') audioContext.resume().catch(() => {});
+
+                    // Reconstruct audioHistory from saved entries
+                    let relStart = 0;
+                    audioHistory = cached.entries.map(e => {
+                        const data  = new Float32Array(e.data);
+                        const entry = {
+                            relStart,
+                            duration:     data.length / e.sampleRate,
+                            data,
+                            sampleRate:   e.sampleRate,
+                            countAsChunk: e.countAsChunk,
+                            sentenceIndex: e.sentenceIndex,
+                            pauseAfter:   e.pauseAfter,
+                        };
+                        relStart += entry.duration + e.pauseAfter;
+                        return entry;
+                    });
+
+                    historyTotalDuration   = relStart;
+                    totalScheduledDuration = relStart;
+                    generationDone  = true;
+                    autoPlayMode    = false;
+                    nextPlayTime    = 0;
+                    firstChunkStartTime = 0;
+                    isPlaying       = false;
+                    scheduledSources = [];
+                    pendingChunks   = [];
+                    chunksAhead     = 0;
+                    chunksReadySent = false;
+                    articleTitle    = cached.title;
+
+                    // Restore saved playback position (if any)
+                    const savedPos = await loadPosition(message.url);
+                    const resumeAt = savedPos?.position ?? 0;
+                    currentPageUrl = normUrl(message.url);
+
+                    console.log(`[offscreen] loaded ${audioHistory.length} chunks (${historyTotalDuration.toFixed(1)}s) from cache, resume at ${resumeAt.toFixed(2)}s`);
+                    pausedAtTime = resumeAt;
+                    notifySW({ type: 'STATUS_UPDATE', text: `"${cached.title}" ready to play` });
+                    notifySW({ type: 'PROGRESS_UPDATE', pct: 0, current: resumeAt, total: historyTotalDuration });
+                    notifySW({ type: 'DOWNLOAD_READY' });
+                } catch (err) {
+                    console.error('[offscreen] LOAD_FROM_CACHE error:', err);
+                    notifySW({ type: 'CACHE_MISS' });
+                }
+            })();
+            return false;
+        }
+
+        case 'RESTORE_SESSION': {
+            // Chrome terminated the offscreen while the user was paused.
+            // Rebuild audio state from the persistent IDB stores and resume playback.
+            (async () => {
+                try {
+                    const url = message.url;
+                    const [sessionPos, chunks] = await Promise.all([
+                        loadPosition(url),
+                        loadChunks(url),
+                    ]);
+
+                    // Fall back to complete audio store if individual chunks are gone
+                    // (generation finished before termination → clearChunks already ran)
+                    let audioEntries = chunks;
+                    let fromCompleteCache = false;
+                    if (audioEntries.length === 0) {
+                        const cached = await loadFromCache(url);
+                        if (cached?.entries?.length > 0) {
+                            audioEntries = cached.entries;
+                            fromCompleteCache = true;
+                        }
+                    }
+
+                    if (audioEntries.length === 0) {
+                        console.warn('[offscreen] RESTORE_SESSION: no data found for', url);
+                        notifySW({ type: 'CACHE_MISS' });
+                        return;
+                    }
+
+                    // Rebuild AudioContext and audioHistory
+                    stopProgressTracking();
+                    if (audioContext) { try { audioContext.close(); } catch (_) {} }
+                    audioContext = new AudioContext({ sampleRate: 24000 });
+                    if (audioContext.state === 'suspended') audioContext.resume().catch(() => {});
+
+                    let relStart = 0;
+                    audioHistory = audioEntries.map(entry => {
+                        const data = new Float32Array(entry.data);
+                        const e = {
+                            relStart,
+                            duration:      data.length / entry.sampleRate,
+                            data,
+                            sampleRate:    entry.sampleRate,
+                            countAsChunk:  entry.countAsChunk,
+                            sentenceIndex: entry.sentenceIndex,
+                            pauseAfter:    entry.pauseAfter,
+                        };
+                        relStart += e.duration + entry.pauseAfter;
+                        return e;
+                    });
+
+                    historyTotalDuration   = relStart;
+                    totalScheduledDuration = relStart;
+                    scheduledSources       = [];
+                    pendingChunks          = [];
+                    chunksAhead            = 0;
+                    isPlaying              = false;
+                    autoPlayMode           = false;
+                    chunksReadySent        = true;
+                    generationDone         = sessionPos?.generationComplete ?? fromCompleteCache;
+                    articleTitle           = sessionPos?.title ?? '';
+                    currentPageUrl         = normUrl(url);
+                    nextPlayTime           = 0;
+                    firstChunkStartTime    = 0;
+                    pausedAtTime           = sessionPos?.position ?? 0;
+
+                    // chunkSaveIndex must continue from where we left off so new
+                    // appendChunk calls don't overwrite existing IDB entries
+                    chunkSaveIndex = audioHistory.length;
+
+                    console.log(`[offscreen] RESTORE_SESSION: ${audioHistory.length} chunks (${historyTotalDuration.toFixed(1)}s), resuming from ${pausedAtTime.toFixed(2)}s`);
+
+                    // Seek to saved position and auto-play
+                    seekTo(pausedAtTime);
+
+                    notifySW({ type: 'CHUNKS_READY' });
+                    if (generationDone) {
+                        notifySW({ type: 'DOWNLOAD_READY' });
+                    } else {
+                        // Generation was interrupted — resume it from the next sentence
+                        const job = await loadGenerationJob(url);
+                        if (job?.sentences?.length > 0) {
+                            // Derive last generated sentence index from saved chunks
+                            const lastIdx = audioEntries.reduce((max, e) =>
+                                (e.sentenceIndex != null) ? Math.max(max, e.sentenceIndex) : max, -1);
+                            const resumeFrom = lastIdx + 1;
+                            if (resumeFrom < job.sentences.length) {
+                                const resumeSentences = job.sentences.slice(resumeFrom);
+                                console.log(`[offscreen] RESTORE_SESSION: resuming generation from sentence ${resumeFrom}/${job.sentences.length}`);
+                                const doResume = () => {
+                                    currentGenId++;
+                                    lastSentenceGenerated = lastIdx;
+                                    ttsWorker.postMessage({
+                                        type:        'GENERATE_AUDIO',
+                                        sentences:   resumeSentences,
+                                        speed:       currentUserSpeed,
+                                        voice:       currentVoiceName,
+                                        genId:       currentGenId,
+                                        indexOffset: resumeFrom,
+                                    });
+                                };
+                                if (modelReady) {
+                                    doResume();
+                                } else {
+                                    // Model is still loading — queue for MODEL_READY
+                                    pendingResume = doResume;
+                                }
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.error('[offscreen] RESTORE_SESSION error:', err);
+                    notifySW({ type: 'CACHE_MISS' });
+                }
+            })();
+            return false;
+        }
+
         case 'CANCEL_ALL': {
             if (ttsWorker) ttsWorker.postMessage({ type: 'CANCEL' });
             stopPlayback();
@@ -634,11 +1114,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'QUERY_READY_STATE': {
-            // Service worker queries this before showing widget after 2s delay
+            // Legacy — kept for compatibility; SW no longer calls this
             const sentenceCount = pendingChunks.filter((c) => c.countAsChunk).length;
             const chunksReady = (sentenceCount >= PREBUFFER_COUNT) || (generationDone && pendingChunks.length > 0);
             sendResponse({ chunksReady });
-            return true; // keep channel open for sendResponse
+            return true;
         }
     }
 
@@ -670,4 +1150,9 @@ async function loadPreferences() {
     console.log('[offscreen] loaded prefs, voice:', voice, 'speed:', currentUserSpeed);
     initWorker(voice);
     console.log('[offscreen] initWorker called, waiting for MODEL_READY...');
+    // Housekeeping: purge expired cache entries on startup
+    clearExpired().catch(() => {});
+    // Signal to the service worker that offscreen is alive.
+    // SW will send RESTORE_SESSION if this was an unexpected restart after termination.
+    notifySW({ type: 'OFFSCREEN_READY' });
 })();

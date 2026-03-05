@@ -50,16 +50,20 @@ module.exports = {
             patterns: [
                 { from: 'src/manifest.json', to: 'manifest.json' },
                 { from: 'src/offscreen/offscreen.html', to: 'offscreen.html' },
+                { from: 'src/onboarding/onboarding.html', to: 'onboarding.html' },
+                { from: 'src/onboarding/onboarding.js', to: 'onboarding.js' },
                 { from: 'src/assets/icons', to: 'icons' },
-                // Voice embeddings (14MB) — small enough to copy on every build
-                { from: 'models/voices', to: 'models/voices' },
-                // ONNX Runtime WASM files must be accessible at runtime
-                {
-                    from: 'node_modules/onnxruntime-web/dist/*.wasm',
-                    to: 'wasm/[name][ext]',
-                },
-                // NOTE: kokoro-v1.0.onnx (310MB) is NOT copied here.
-                // Run `npm run copy-model` once to copy it to dist/models/.
+                // ONNX Runtime WASM files — single-threaded only.
+                // Multi-threaded ORT spawns sub-workers via blob: URLs which Chrome
+                // blocks in extension workers. simd: primary, basic: fallback.
+                { from: 'node_modules/onnxruntime-web/dist/ort-wasm-simd.wasm', to: 'wasm/[name][ext]' },
+                { from: 'node_modules/onnxruntime-web/dist/ort-wasm.wasm', to: 'wasm/[name][ext]' },
+                // NOTE: kokoro-v1.0.onnx and voices/ are no longer bundled.
+                // They are downloaded from Hugging Face on first use and cached
+                // in OPFS (Origin Private File System) for subsequent launches.
+                // For local development only, you can still run:
+                //   npm run copy-model   → copies kokoro-v1.0.onnx to dist/models/
+                //   (copy voices manually to dist/models/voices/ if needed)
             ],
         }),
     ],

@@ -22,7 +22,7 @@ export const WIDGET_CSS = `
     width: 56px;
     height: 56px;
     border-radius: 50%;
-    background: #6366f1;
+    background: #FA8072;
     border: none;
     cursor: pointer;
     display: flex;
@@ -57,7 +57,7 @@ export const WIDGET_CSS = `
     position: absolute;
     inset: -4px;
     border-radius: 50%;
-    border: 2px solid #6366f1;
+    border: 2px solid #FA8072;
     animation: tts-pulse 1.5s ease-in-out infinite;
 }
 
@@ -74,7 +74,7 @@ export const WIDGET_CSS = `
     inset: -4px;
     border-radius: 50%;
     border: 3px solid transparent;
-    border-top-color: #6366f1;
+    border-top-color: #FA8072;
     animation: tts-spin 0.8s linear infinite;
 }
 
@@ -111,13 +111,13 @@ export const WIDGET_CSS = `
     opacity: 1;
 }
 
-/* Close button — 12 o'clock (top) */
+/* Close + Download buttons — 12 o'clock (top) */
 .tts-radial-item.pos-top {
     transform: translate(-50%, -50%);
 }
 .tts-widget:hover .tts-radial-item.pos-top,
 .tts-widget.menu-open .tts-radial-item.pos-top {
-    transform: translate(-50%, -50%) translate(-2px, -50px) scale(1);
+    transform: translate(-50%, -50%) translateY(-58px) scale(1);
 }
 
 /* Speed control — 9 o'clock (left) */
@@ -147,10 +147,17 @@ export const WIDGET_CSS = `
     transform: translate(-50%, -50%) translateY(50px) scale(1);
 }
 
+/* ── Top controls row (close + download) ─────────────────────────────────── */
+.tts-top-controls {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
 /* ── Close button ────────────────────────────────────────────────────────── */
 .tts-close-btn {
-    width: 32px;
-    height: 32px;
+    width: 30px;
+    height: 30px;
     border-radius: 50%;
     background: #ef4444;
     border: none;
@@ -168,8 +175,38 @@ export const WIDGET_CSS = `
 }
 
 .tts-close-btn svg {
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
+    fill: #fff;
+}
+
+/* ── Download circle button ──────────────────────────────────────────────── */
+.tts-download-circle-btn {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: #FA8072;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+}
+
+.tts-download-circle-btn:hover {
+    background: #e8604e;
+    transform: scale(1.1);
+}
+
+.tts-download-circle-btn.queued {
+    opacity: 0.55;
+}
+
+.tts-download-circle-btn svg {
+    width: 13px;
+    height: 13px;
     fill: #fff;
 }
 
@@ -218,7 +255,7 @@ export const WIDGET_CSS = `
 }
 
 .tts-voice-select:focus {
-    border-color: #6366f1;
+    border-color: #FA8072;
 }
 
 /* ── Speed / Seeker slider ───────────────────────────────────────────────── */
@@ -240,13 +277,13 @@ export const WIDGET_CSS = `
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: #6366f1;
+    background: #FA8072;
     cursor: pointer;
 }
 
 .tts-speed-value,
 .tts-seeker-time {
-    color: #a5b4fc;
+    color: #fca99b;
     font-size: 11px;
     font-weight: 600;
     min-width: 28px;
@@ -256,7 +293,7 @@ export const WIDGET_CSS = `
 
 /* ── Voice change notification ───────────────────────────────────────────── */
 .tts-voice-notify {
-    color: #a5b4fc;
+    color: #fca99b;
     font-size: 10px;
     font-weight: 600;
     flex: 1;
@@ -294,4 +331,5 @@ export const WIDGET_CSS = `
 .tts-widget.hidden {
     display: none;
 }
+
 `;

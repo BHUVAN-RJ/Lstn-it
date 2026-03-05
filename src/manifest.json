@@ -1,14 +1,14 @@
 {
     "manifest_version": 3,
-    "name": "Kokoro TTS",
-    "version": "0.2.0",
-    "description": "Read any article aloud using on-device Kokoro TTS — no server required.",
+    "name": "AudiTex",
+    "version": "0.2.3",
+    "description": "Read any article aloud using on-device AI — no server required.",
 
     "permissions": [
         "activeTab",
         "tabs",
         "storage",
-        "scripting",
+        "unlimitedStorage",
         "offscreen",
         "contextMenus",
         "downloads"
@@ -27,9 +27,10 @@
     ],
 
     "action": {
-        "default_title": "Kokoro TTS — Read this page aloud",
+        "default_title": "AudiTex — Read this page aloud",
         "default_icon": {
             "16": "icons/icon16.png",
+            "32": "icons/icon32.png",
             "48": "icons/icon48.png",
             "128": "icons/icon128.png"
         }
@@ -37,6 +38,7 @@
 
     "icons": {
         "16": "icons/icon16.png",
+        "32": "icons/icon32.png",
         "48": "icons/icon48.png",
         "128": "icons/icon128.png"
     },
@@ -48,9 +50,6 @@
     "web_accessible_resources": [
         {
             "resources": [
-                "models/kokoro-v1.0.onnx",
-                "models/voices/*.bin",
-                "models/voices/manifest.json",
                 "wasm/*.wasm",
                 "tts-worker.js",
                 "offscreen.html"
