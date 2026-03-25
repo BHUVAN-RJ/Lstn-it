@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Model files (large — downloaded at runtime)
+models/
+*.onnx
+*.bin
+
+# Zip artifacts
+*.zip
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

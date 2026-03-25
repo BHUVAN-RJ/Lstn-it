@@ -23,7 +23,7 @@ const RAW_ENTRIES = [
     // — Tech / startup brands —
     { from: 'Airbnb',       to: 'Air BNB' },
     { from: "IonQ's",       to: 'Ion cues' },
-    { from: 'Chesky',       to: 'Chess key' },
+    { from: 'Chesky',       to: 'Chesky' },
     { from: 'Node.js',      to: 'NodeJS' },
     { from: 'iPhone',       to: 'Iphone' },
 

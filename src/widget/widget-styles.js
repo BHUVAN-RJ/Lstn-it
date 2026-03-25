@@ -210,6 +210,79 @@ export const WIDGET_CSS = `
     fill: #fff;
 }
 
+/* ── Read Only button ────────────────────────────────────────────────────── */
+.tts-read-btn {
+    height: 22px;
+    padding: 0 9px;
+    border-radius: 11px;
+    background: #fff;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 0 0 2px #FA8072, 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+    font-size: 10px;
+    font-weight: 600;
+    color: #FA8072;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+}
+
+.tts-read-btn:hover {
+    background: #fff0ee;
+    transform: scale(1.05);
+}
+
+.tts-read-btn.active {
+    background: #FA8072;
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(250, 128, 114, 0.4);
+}
+
+.tts-read-btn.active:hover {
+    background: #e8604e;
+}
+
+/* ── WPM control (replaces speed slider in read mode) ────────────────────── */
+.tts-wpm-control {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+}
+
+.tts-wpm-btn {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #2e2e42;
+    border: 1px solid #3e3e5a;
+    color: #fca99b;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background 0.15s;
+}
+
+.tts-wpm-btn:hover {
+    background: #3e3e5a;
+}
+
+.tts-wpm-value {
+    flex: 1;
+    text-align: center;
+    font-size: 10px;
+    color: #fca99b;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
 /* ── Shared control container (voice + speed + seeker use same base) ─────── */
 .tts-control-container {
     background: #1e1e2e;

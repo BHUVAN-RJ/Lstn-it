@@ -13,9 +13,14 @@ module.exports = {
     output: {
         path: path.resolve(__dirname, 'dist'),
         filename: '[name].js',
-        // Don't wipe the whole dist/ on rebuild — that would delete
-        // dist/models/kokoro-v1.0.onnx which is copied separately via copy-model.
-        clean: false,
+        // clean: false would leave deleted source files as orphans in dist/.
+        // clean with keep: preserves dist/models/ (310 MB ONNX model + voices)
+        // while removing stale bundles on each rebuild.
+        clean: {
+            keep(asset) {
+                return asset.startsWith('models/');
+            },
+        },
     },
     module: {
         rules: [
@@ -54,8 +59,7 @@ module.exports = {
                 { from: 'src/onboarding/onboarding.js', to: 'onboarding.js' },
                 { from: 'src/assets/icons', to: 'icons' },
                 // ONNX Runtime WASM files — single-threaded only.
-                // Multi-threaded ORT spawns sub-workers via blob: URLs which Chrome
-                // blocks in extension workers. simd: primary, basic: fallback.
+                // MV3 rejects blob: in worker-src CSP, blocking ORT's threading mechanism.
                 { from: 'node_modules/onnxruntime-web/dist/ort-wasm-simd.wasm', to: 'wasm/[name][ext]' },
                 { from: 'node_modules/onnxruntime-web/dist/ort-wasm.wasm', to: 'wasm/[name][ext]' },
                 // NOTE: kokoro-v1.0.onnx and voices/ are no longer bundled.

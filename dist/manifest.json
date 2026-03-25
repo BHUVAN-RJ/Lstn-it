@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
-    "name": "AudiTex",
-    "version": "0.2.3",
-    "description": "Read any article aloud using on-device AI — no server required.",
+    "name": "AudiTex - TTS",
+    "version": "1.0.0",
+    "description": "The best free TTS extension. Natural-sounding voices, instant playback, free forever.",
 
     "permissions": [
         "activeTab",
@@ -41,6 +41,16 @@
         "32": "icons/icon32.png",
         "48": "icons/icon48.png",
         "128": "icons/icon128.png"
+    },
+
+    "commands": {
+        "_execute_action": {
+            "suggested_key": {
+                "default": "Alt+Shift+A",
+                "mac":     "Alt+Shift+A"
+            },
+            "description": "Activate AudiTex — read this page aloud"
+        }
     },
 
     "content_security_policy": {

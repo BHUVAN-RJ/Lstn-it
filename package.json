@@ -7,7 +7,8 @@
     "build": "webpack --config webpack.config.js",
     "watch": "webpack --watch",
     "dev": "webpack --mode development --watch",
-    "copy-model": "mkdir -p dist/models && cp models/kokoro-v1.0.onnx dist/models/kokoro-v1.0.onnx"
+    "copy-model": "mkdir -p dist/models && cp models/kokoro-v1.0.onnx dist/models/kokoro-v1.0.onnx",
+    "test": "jest"
   },
   "keywords": [],
   "author": "",
@@ -15,8 +16,11 @@
   "devDependencies": {
     "@babel/core": "^7.29.0",
     "@babel/preset-env": "^7.29.0",
+    "babel-jest": "^29.0.0",
     "babel-loader": "^10.0.0",
     "copy-webpack-plugin": "^13.0.1",
+    "jest": "^29.0.0",
+    "jest-environment-jsdom": "^30.3.0",
     "webpack": "^5.105.2",
     "webpack-cli": "^6.0.1"
   },

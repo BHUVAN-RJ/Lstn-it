@@ -10,8 +10,8 @@ import { tokenize } from './tokenizer.js';
 import { applyPronunciationMap } from './pronunciation-map.js';
 
 // ── ort environment — set at module level, before InferenceSession.create() ──
-// numThreads must stay at 1 in Chrome extension workers — ORT Web's threading
-// spawns sub-workers via blob: URLs which Chrome blocks in extension contexts.
+// numThreads fixed at 1 — MV3 rejects blob: in worker-src CSP, which ORT Web
+// requires to spawn threaded sub-workers. Threading is permanently unavailable.
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 
@@ -32,6 +32,16 @@ async function opfsFileExists(filename) {
         await root.getFileHandle(filename);
         return true;
     } catch { return false; }
+}
+
+/** Get the size of an existing OPFS file (0 if not found). */
+async function opfsFileSize(filename) {
+    try {
+        const root = await navigator.storage.getDirectory();
+        const handle = await root.getFileHandle(filename);
+        const file = await handle.getFile();
+        return file.size;
+    } catch { return 0; }
 }
 
 async function loadFromOpfs(filename) {
@@ -284,7 +294,7 @@ async function loadModel({ voice, wasmPaths, modelUrl, voiceBaseUrl: vbu, remote
     post({ type: 'LOADING_PROGRESS', stage: 'wasm', pct: 0 });
     ort.env.wasm.wasmPaths = wasmPaths;
 
-    // ── 1. Resolve model buffer: OPFS cache → remote download → local bundle ──
+    // ── 1. Resolve model buffer: OPFS cache → streaming download to OPFS ──
     let modelBuffer;
     const isCached = await opfsFileExists(OPFS_MODEL_FILE);
 
@@ -294,21 +304,15 @@ async function loadModel({ voice, wasmPaths, modelUrl, voiceBaseUrl: vbu, remote
         modelBuffer = await loadFromOpfs(OPFS_MODEL_FILE);
         post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 80 });
     } else {
+        // Stream directly to OPFS — no 620MB memory spike.
+        // fetchToOpfsWithProgress handles retry + resume automatically.
         const downloadUrl = remoteModelUrl || modelUrl;
         console.log('[tts-worker] downloading model from', downloadUrl);
         post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: 0 });
-        modelBuffer = await fetchWithProgress(downloadUrl, (pct) => {
+        modelBuffer = await fetchToOpfsWithProgress(downloadUrl, OPFS_MODEL_FILE, (pct) => {
             post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: Math.round(pct * 78) });
         });
-        // Persist to OPFS so next launch is instant
-        post({ type: 'LOADING_PROGRESS', stage: 'saving', pct: 78 });
-        console.log('[tts-worker] saving model to OPFS...');
-        try {
-            await saveToOpfs(OPFS_MODEL_FILE, modelBuffer);
-            console.log('[tts-worker] model cached in OPFS');
-        } catch (err) {
-            console.warn('[tts-worker] OPFS save failed (non-fatal):', err);
-        }
+        post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 80 });
     }
 
     // ── 2. Create ONNX session (retry once if OPFS file is corrupt) ──
@@ -318,16 +322,14 @@ async function loadModel({ voice, wasmPaths, modelUrl, voiceBaseUrl: vbu, remote
         onnxSession = await ort.InferenceSession.create(modelBuffer, { executionProviders: ['wasm'] });
     } catch (err) {
         if (isCached) {
-            // Cached file may be corrupt — delete it and re-download
+            // Cached file may be corrupt — delete and re-download via streaming
             console.warn('[tts-worker] cached model failed to load, re-downloading...', err);
             await deleteFromOpfs(OPFS_MODEL_FILE);
             const downloadUrl = remoteModelUrl || modelUrl;
             post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: 0 });
-            modelBuffer = await fetchWithProgress(downloadUrl, (pct) => {
+            modelBuffer = await fetchToOpfsWithProgress(downloadUrl, OPFS_MODEL_FILE, (pct) => {
                 post({ type: 'LOADING_PROGRESS', stage: 'downloading', pct: Math.round(pct * 78) });
             });
-            post({ type: 'LOADING_PROGRESS', stage: 'saving', pct: 78 });
-            await saveToOpfs(OPFS_MODEL_FILE, modelBuffer).catch(() => {});
             post({ type: 'LOADING_PROGRESS', stage: 'model', pct: 82 });
             onnxSession = await ort.InferenceSession.create(modelBuffer, { executionProviders: ['wasm'] });
         } else {
@@ -360,20 +362,148 @@ async function loadVoice(voiceName) {
     } else {
         const url = (remoteVoiceBaseUrl || voiceBaseUrl) + voiceName + '.bin';
         console.log('[tts-worker] downloading voice', voiceName, 'from', url);
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`Voice file not found: ${voiceName} (${response.status})`);
-        const buffer = await response.arrayBuffer();
-        // Cache to OPFS (fire-and-forget — don't block playback on the save)
-        saveToOpfs(opfsFile, buffer).catch(err => console.warn('[tts-worker] voice OPFS save failed:', err));
+        // Use streaming download with retry + resume (same as model download)
+        const buffer = await fetchToOpfsWithProgress(url, opfsFile, () => {});
         voiceData = new Float32Array(buffer);
     }
     activeVoice = voiceName;
 
     if (voiceData.length !== 510 * 256) {
-        throw new Error(`Unexpected voice file size: ${voiceData.length} floats (expected ${510 * 256})`);
+        // File appears corrupt — delete it and re-download once
+        console.warn('[tts-worker] voice file size mismatch — deleting and re-downloading', voiceName);
+        await deleteFromOpfs(opfsFile);
+        const retryUrl = (remoteVoiceBaseUrl || voiceBaseUrl) + voiceName + '.bin';
+        const retryBuffer = await fetchToOpfsWithProgress(retryUrl, opfsFile, () => {});
+        voiceData = new Float32Array(retryBuffer);
+        activeVoice = voiceName;
+        if (voiceData.length !== 510 * 256) {
+            throw new Error(`Unexpected voice file size: ${voiceData.length} floats (expected ${510 * 256})`);
+        }
     }
 }
 
+// ── Download with streaming-to-OPFS, resume, and retry ──────────────────────
+//
+// Streams directly to an OPFS file instead of accumulating chunks in memory.
+// For a 310 MB model this avoids a ~620 MB memory spike (chunks + combined).
+// Supports HTTP Range resume if a partial download exists in OPFS.
+// Retries up to 3 times with exponential backoff on failure.
+
+const DOWNLOAD_MAX_RETRIES = 3;
+const DOWNLOAD_BACKOFF_MS  = [1000, 3000, 10000];
+
+/**
+ * Download `url` into an OPFS file, streaming chunks directly to disk.
+ * Returns the complete file as an ArrayBuffer after download finishes.
+ *
+ * @param {string} url             - Remote URL to fetch
+ * @param {string} opfsFilename    - OPFS filename to stream into
+ * @param {Function} onProgress    - Called with (fraction 0–1) as data arrives
+ * @returns {Promise<ArrayBuffer>} - The finished file contents
+ */
+async function fetchToOpfsWithProgress(url, opfsFilename, onProgress) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= DOWNLOAD_MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+            const delay = DOWNLOAD_BACKOFF_MS[Math.min(attempt - 1, DOWNLOAD_BACKOFF_MS.length - 1)];
+            console.log(`[tts-worker] download retry ${attempt}/${DOWNLOAD_MAX_RETRIES} after ${delay}ms`);
+            post({ type: 'LOADING_PROGRESS', stage: 'retrying', pct: 0 });
+            await new Promise(r => setTimeout(r, delay));
+        }
+
+        try {
+            // Check how much we already have (for resume)
+            const existingSize = await opfsFileSize(opfsFilename);
+
+            const headers = {};
+            if (existingSize > 0) {
+                headers['Range'] = `bytes=${existingSize}-`;
+                console.log(`[tts-worker] resuming download from byte ${existingSize}`);
+            }
+
+            const response = await fetch(url, { headers });
+
+            // 416 = Range Not Satisfiable — file already fully downloaded
+            if (response.status === 416) {
+                console.log('[tts-worker] file already fully downloaded (416)');
+                onProgress(1);
+                return loadFromOpfs(opfsFilename);
+            }
+
+            if (!response.ok && response.status !== 206) {
+                throw new Error(`HTTP ${response.status} fetching ${url}`);
+            }
+
+            // Determine total size
+            const isPartial = response.status === 206;
+            let totalSize = 0;
+            if (isPartial) {
+                // Content-Range: bytes 12345-99999/100000
+                const rangeHeader = response.headers.get('Content-Range');
+                const rangeMatch = rangeHeader?.match(/\/(\d+)/);
+                totalSize = rangeMatch ? parseInt(rangeMatch[1], 10) : 0;
+            } else {
+                const cl = response.headers.get('Content-Length');
+                totalSize = cl ? parseInt(cl, 10) : 0;
+            }
+
+            // If server doesn't support Range and we had partial data, start fresh
+            if (!isPartial && existingSize > 0) {
+                await deleteFromOpfs(opfsFilename);
+            }
+
+            const startByte = isPartial ? existingSize : 0;
+            let received = startByte;
+
+            // Open OPFS writable stream — append if resuming, create if fresh
+            const root = await navigator.storage.getDirectory();
+            const handle = await root.getFileHandle(opfsFilename, { create: true });
+            const writable = await handle.createWritable({ keepExistingData: isPartial });
+            // Seek to the end for append
+            if (isPartial && startByte > 0) {
+                await writable.seek(startByte);
+            }
+
+            const reader = response.body.getReader();
+
+            // Stream chunks directly to OPFS
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                await writable.write(value);
+                received += value.length;
+                if (totalSize > 0) {
+                    onProgress(received / totalSize);
+                }
+            }
+
+            await writable.close();
+
+            // Validate file size
+            const finalSize = await opfsFileSize(opfsFilename);
+            if (totalSize > 0 && finalSize !== totalSize) {
+                throw new Error(`Size mismatch: expected ${totalSize}, got ${finalSize}`);
+            }
+
+            console.log(`[tts-worker] download complete: ${finalSize} bytes`);
+            onProgress(1);
+            return loadFromOpfs(opfsFilename);
+
+        } catch (err) {
+            lastError = err;
+            console.warn(`[tts-worker] download attempt ${attempt + 1} failed:`, err.message);
+            // Don't delete partial file — next attempt will resume from it
+        }
+    }
+
+    // All retries exhausted — clean up partial file and report failure
+    await deleteFromOpfs(opfsFilename);
+    post({ type: 'DOWNLOAD_FAILED', detail: lastError?.message || 'Download failed after retries' });
+    throw lastError;
+}
+
+// Legacy fallback for small files (voices) that don't need streaming
 async function fetchWithProgress(url, onProgress) {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);

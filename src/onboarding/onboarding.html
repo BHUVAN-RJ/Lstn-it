@@ -162,6 +162,53 @@
         }
         .privacy-text strong { color: #f0f0f0; }
 
+        /* ── Voice picker ── */
+        .voice-picker-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+        .voice-picker-label {
+            font-size: 13px;
+            color: #ccc;
+            flex: 1;
+        }
+        .voice-picker-label span {
+            display: block;
+            font-size: 11px;
+            color: #666;
+            margin-top: 3px;
+        }
+        .voice-select {
+            background: #242424;
+            border: 1px solid #363636;
+            border-radius: 8px;
+            color: #f0f0f0;
+            font-size: 13px;
+            padding: 8px 12px;
+            cursor: pointer;
+            min-width: 160px;
+            outline: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23888' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            padding-right: 32px;
+        }
+        .voice-select:hover { border-color: #FA8072; }
+        .voice-select optgroup { background: #1a1a1a; color: #FA8072; font-size: 11px; }
+        .voice-select option { background: #1a1a1a; color: #f0f0f0; }
+        .voice-saved-note {
+            font-size: 12px;
+            color: #FA8072;
+            margin-top: 12px;
+            min-height: 16px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .voice-saved-note.show { opacity: 1; }
+
         /* ── Footer ── */
         .footer {
             margin-top: 40px;
@@ -197,6 +244,10 @@
                 <div class="progress-bar-fill" id="progress-fill"></div>
             </div>
             <div class="progress-status" id="progress-text">Initialising&hellip;</div>
+            <div id="error-section" style="display:none; margin-top:14px;">
+                <div style="color:#FA8072; font-size:14px; font-weight:600; margin-bottom:8px;" id="error-text">Download failed</div>
+                <button id="retry-btn" style="background:#FA8072; color:white; border:none; border-radius:8px; padding:8px 20px; font-size:13px; font-weight:600; cursor:pointer; transition:background 0.2s;">Retry download</button>
+            </div>
         </div>
 
         <div class="done-banner" id="done-banner">
@@ -213,6 +264,53 @@
 
     </div>
 
+    <!-- Voice preference -->
+    <div class="card" id="voice-card">
+        <div class="card-label">Default voice</div>
+        <div class="voice-picker-row">
+            <div class="voice-picker-label">
+                Choose your preferred voice
+                <span>You can change this any time from the widget.</span>
+            </div>
+            <select class="voice-select" id="voice-select">
+                <optgroup label="Default">
+                    <option value="af_aoede">Aoede</option>
+                </optgroup>
+                <optgroup label="Favorites">
+                    <option value="af_sarah">Sarah</option>
+                    <option value="af_heart">Heart</option>
+                    <option value="af_sky">Sky</option>
+                    <option value="af_bella">Bella</option>
+                    <option value="af_jessica">Jessica</option>
+                    <option value="af_kore">Kore</option>
+                    <option value="af_nova">Nova</option>
+                    <option value="am_eric">Eric</option>
+                    <option value="bf_lily">Lily</option>
+                </optgroup>
+                <optgroup label="More Voices">
+                    <option value="af_alloy">Alloy</option>
+                    <option value="af_nicole">Nicole</option>
+                    <option value="af_river">River</option>
+                    <option value="am_adam">Adam</option>
+                    <option value="am_echo">Echo</option>
+                    <option value="am_fenrir">Fenrir</option>
+                    <option value="am_liam">Liam</option>
+                    <option value="am_michael">Michael</option>
+                    <option value="am_onyx">Onyx</option>
+                    <option value="am_puck">Puck</option>
+                    <option value="bf_alice">Alice</option>
+                    <option value="bf_emma">Emma</option>
+                    <option value="bf_isabella">Isabella</option>
+                    <option value="bm_daniel">Daniel</option>
+                    <option value="bm_fable">Fable</option>
+                    <option value="bm_george">George</option>
+                    <option value="bm_lewis">Lewis</option>
+                </optgroup>
+            </select>
+        </div>
+        <div class="voice-saved-note" id="voice-saved-note">&#10003; Saved</div>
+    </div>
+
     <!-- How to use -->
     <div class="card">
         <div class="card-label">How to use</div>
@@ -220,22 +318,22 @@
             <li class="step">
                 <div class="step-num">1</div>
                 <div class="step-body">
-                    <div class="step-title">Click the AudiTex icon</div>
-                    <div class="step-desc">Click the extension icon in the toolbar on any webpage to start reading.</div>
+                    <div class="step-title">Right-click &rarr; Read aloud with AudiTex</div>
+                    <div class="step-desc">Right-click anywhere on a webpage and select &ldquo;Read aloud with AudiTex&rdquo;.</div>
                 </div>
             </li>
             <li class="step">
                 <div class="step-num">2</div>
                 <div class="step-body">
-                    <div class="step-title">Or select text &rarr; right-click</div>
-                    <div class="step-desc">Highlight any text, right-click, and choose &ldquo;Read aloud with AudiTex&rdquo;. Works on PDFs too.</div>
+                    <div class="step-title">Control playback from the floating widget</div>
+                    <div class="step-desc">Pause, change voice, or adjust speed using the circle widget that appears on the page.</div>
                 </div>
             </li>
             <li class="step">
                 <div class="step-num">3</div>
                 <div class="step-body">
-                    <div class="step-title">Control playback from the floating widget</div>
-                    <div class="step-desc">Pause, change voice, or adjust speed using the circle widget that appears on the page.</div>
+                    <div class="step-title">Read Only mode &mdash; highlight without audio</div>
+                    <div class="step-desc">Click &ldquo;Read Only&rdquo; in the widget to switch to silent reading mode. Sentences are highlighted at your chosen reading pace (WPM). Your mode and position are saved, so it picks up where you left off on every page.</div>
                 </div>
             </li>
         </ul>

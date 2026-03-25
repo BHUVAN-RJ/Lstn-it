@@ -1,20 +1,78 @@
-// content-script.js — DOM extraction + floating widget injection
+// content-script.js — Thin orchestrator: wires extraction, read-mode, widget, and audio player.
+//
+// Audio playback lives in audio-player.js (survives offscreen termination).
+// Page text extraction logic lives in extraction.js.
+// Read-mode timer state machine lives in read-mode.js.
 
-import { extractTextFromElement, cleanText, isValidText } from '../utils/text-cleaner.js';
+import { extractPageText, countWords } from './extraction.js';
 import { splitSentences } from '../utils/sentence-splitter.js';
-import { createWidget, showWidget, hideWidget, updateState, updateStatus, updateSeeker, markGenerationDone } from '../widget/widget.js';
+import {
+    initReadMode as initReadModeModule,
+    loadReadModePreferences,
+    isEnabled as isReadModeEnabled,
+    isPaused as isReadModePaused,
+    getWpm as getReadModeWpm,
+    getSentences as getReadModeSentences,
+    setSentences as setReadModeSentences,
+    getPageUrl as getReadModePageUrl,
+    setPageUrl as setReadModePageUrl,
+    getSentenceIndex as getReadModeSentenceIndex,
+    startReadMode,
+    stopReadMode,
+    toggleReadModePlayPause,
+    adjustWpm,
+    getPositionKey,
+    DEFAULT_WPM,
+} from './read-mode.js';
+import {
+    createWidget, showWidget, hideWidget,
+    updateState, updateStatus, updateSeeker,
+    markGenerationDone, setActionHandler, updateReadMode,
+} from '../widget/widget.js';
 import { prepareHighlighter, highlightSentence, clearHighlight } from '../utils/highlight-injector.js';
+import * as audioPlayer from './audio-player.js';
 
-// ── Widget injection ────────────────────────────────────────────────────────
+// ── Module-level state (only what cannot move to a sub-module) ────────────────
 
 let widgetInjected  = false;
-let chunksReady     = false; // set when CHUNKS_READY received; guards against SHOW_WIDGET/PLAYBACK_STATE reverting to spinner
-let widgetState     = 'loading'; // mirrors the widget's current visual state
+let chunksReady     = false;
+let widgetState     = 'loading';
+
+// Cached extraction result — enables read-mode ↔ audio-mode switching without
+// re-walking the DOM.
+let lastExtractionResult = null;
+
+// Streaming cache load state — accumulates CACHE_LOAD_CHUNK messages until
+// CACHE_LOAD_DONE fires, then hands all entries to the audio player at once.
+let pendingCacheEntries   = [];
+let pendingCacheResume    = 0;
+let pendingCacheTitle     = '';
+
+// Target seek time after a GC-triggered cache reload. Set by the needCacheReload
+// callback, consumed by the CACHE_LOAD_DONE handler once audio is restored.
+let pendingSeekAfterReload = null;
+
+// ── Storage-ready gate ────────────────────────────────────────────────────────
+// SHOW_WIDGET and EXTRACT_AND_STAGE can arrive before storage resolves.
+// Both handlers chain off this promise to avoid a race condition.
+
+let _resolveStorageReady;
+const storageReadyPromise = new Promise(resolve => { _resolveStorageReady = resolve; });
+
+loadReadModePreferences().then(({ enabled, wpm }) => {
+    // Re-sync button state if widget was injected before storage resolved
+    if (widgetInjected) updateReadMode(enabled, wpm);
+    _resolveStorageReady();
+}).catch(() => { _resolveStorageReady(); });
+
+// ── Widget state helper ───────────────────────────────────────────────────────
 
 function setWidgetState(state) {
     widgetState = state;
     updateState(state);
 }
+
+// ── Widget injection ──────────────────────────────────────────────────────────
 
 function injectWidget() {
     if (widgetInjected) return;
@@ -26,152 +84,268 @@ function injectWidget() {
     document.body.appendChild(shadowHost);
 
     const shadow = shadowHost.attachShadow({ mode: 'closed' });
-
     createWidget(shadow, shadowHost);
+
+    // Wire up all widget actions to the local handler
+    setActionHandler(handleWidgetAction);
 }
 
-// ── Extraction strategies (tried in order) ──────────────────────────────────
+// ── Read-mode callbacks ───────────────────────────────────────────────────────
+// Called by read-mode.js to drive the widget and highlighter without
+// importing them directly (avoids circular dependency).
 
-function findArticleElement() {
-    const article = document.querySelector('article');
-    if (article) return article;
+initReadModeModule({
+    stateChange(state) {
+        setWidgetState(state);
+    },
+    statusUpdate(text) {
+        updateStatus(text);
+    },
+    seekerUpdate(current, total) {
+        updateSeeker(current, total);
+    },
+    highlight(index) {
+        highlightSentence(index);
+    },
+    clearHighlight() {
+        clearHighlight();
+    },
+});
 
-    const main = document.querySelector('main');
-    if (main) return main;
+// ── Audio player initialisation ───────────────────────────────────────────────
 
-    const CONTENT_SELECTORS = [
-        '[role="main"]',
-        '.post-content', '.entry-content', '.article-body', '.article-content',
-        '.story-body', '.post-body', '.content-body',
-        '#content', '#main-content', '#article-body',
-    ];
-    for (const sel of CONTENT_SELECTORS) {
-        const el = document.querySelector(sel);
-        if (el) return el;
-    }
-
-    return largestTextBlock();
-}
-
-function largestTextBlock() {
-    let best = null;
-    let bestLen = 0;
-
-    // Include td for table-based old-school sites (e.g. paulgraham.com)
-    const candidates = document.querySelectorAll('div, section, td');
-    for (const el of candidates) {
-        const len = el.innerText?.length ?? 0;
-        // Require either multiple <p> tags or a substantial text length (>400 chars)
-        // so we don't pick tiny cells / navbars on table-based layouts
-        const pCount = el.querySelectorAll('p').length;
-        if (pCount < 3 && len < 400) continue;
-        if (len > bestLen) {
-            bestLen = len;
-            best = el;
+audioPlayer.init({
+    stateChange(state) {
+        console.log('[content-script] audio-player state:', state);
+        if (state === 'stopped' || state === 'done') {
+            chunksReady = false;
+            clearHighlight();
         }
+        // Don't propagate audio state to widget while read-only mode is active —
+        // read mode manages widget state (playing/paused/done) via its own timer.
+        if (isReadModeEnabled()) return;
+        setWidgetState(state);
+    },
+    statusUpdate(text) {
+        updateStatus(text);
+    },
+    progressUpdate(pct, current, total) {
+        updateSeeker(current, total);
+    },
+    sentencePlaying(index) {
+        highlightSentence(index);
+    },
+    chunksReady() {
+        console.log('[content-script] chunks ready — switching to paused');
+        chunksReady = true;
+        if (widgetState !== 'playing') {
+            setWidgetState('paused');
+            updateStatus('Ready \u2014 click to play');
+        }
+    },
+    generationDone() {
+        console.log('[content-script] generation done');
+        markGenerationDone();
+    },
+    generationStall() {
+        // Offscreen may have been killed — ask SW to check and restart
+        console.warn('[content-script] generation stall — pinging SW');
+        chrome.runtime.sendMessage({ type: 'CHECK_OFFSCREEN_HEALTH' }).catch(() => {});
+    },
+    needCacheReload(targetTime) {
+        // Audio data for this seek target was released by GC — reload from cache
+        console.log('[content-script] cache reload requested for seek to', targetTime.toFixed(2));
+        pendingSeekAfterReload = targetTime;
+        chrome.runtime.sendMessage({ type: 'LOAD_FROM_CACHE', url: window.location.href }).catch(() => {});
+    },
+});
+
+// ── Keyboard shortcut: Space = play/pause when TTS widget is active ───────────
+
+document.addEventListener('keydown', (keyEvent) => {
+    if (!widgetInjected) return;
+
+    // Do not intercept keyboard events when the user is typing in a field
+    const targetTag = keyEvent.target.tagName;
+    const isTyping = targetTag === 'INPUT'
+        || targetTag === 'TEXTAREA'
+        || targetTag === 'SELECT'
+        || keyEvent.target.isContentEditable;
+    if (isTyping) return;
+
+    if (keyEvent.code === 'Space' && !keyEvent.ctrlKey && !keyEvent.metaKey && !keyEvent.altKey) {
+        const playerState = audioPlayer.getState();
+        // Only intercept Space when the widget has loaded audio or is visibly active
+        const isActiveWidget = playerState.hasAudio
+            || widgetState === 'playing'
+            || widgetState === 'paused';
+        if (!isActiveWidget) return;
+        keyEvent.preventDefault();
+        keyEvent.stopPropagation();
+        handleWidgetAction({ action: 'TOGGLE_PLAY_PAUSE' });
     }
+}, true); // capture phase — intercepts before the page handles Space
 
-    return best ?? document.body;
-}
+// ── Widget action handler (local routing) ─────────────────────────────────────
 
-function countWords(text) {
-    return text.trim().split(/\s+/).filter(Boolean).length;
-}
+function handleWidgetAction(action) {
+    console.log('[content-script] widget action:', action.action);
 
-function isEditorSite() {
-    const host = location.hostname;
-    return (
-        host.includes('docs.google.com') ||
-        host.includes('sheets.google.com') ||
-        host.includes('slides.google.com') ||
-        host.includes('notion.so') ||
-        host.includes('notion.site') ||
-        host.includes('atlassian.net') ||
-        host.endsWith('.confluence.com') ||
-        host.includes('coda.io') ||
-        host.includes('craft.do') ||
-        host.includes('roamresearch.com') ||
-        host.includes('obsidian.md')
-    );
-}
+    switch (action.action) {
+        case 'TOGGLE_PLAY_PAUSE':
+            if (isReadModeEnabled()) {
+                toggleReadModePlayPause();
+            } else {
+                // Handled locally — AudioContext must stay in user gesture chain
+                audioPlayer.togglePlayPause();
+            }
+            break;
 
-function extractFromInnerText() {
-    const rawText = (document.body.innerText || '').trim();
-    if (!rawText) return { success: false, error: 'NO_TEXT_FOUND' };
-    const sentences = splitSentences(rawText);
-    const validSentences = sentences.filter(s => s.text.trim().length > 1 && countWords(s.text) >= 1);
-    if (validSentences.length === 0) return { success: false, error: 'NO_TEXT_FOUND' };
-    const fullText = validSentences.map(s => s.text).join(' ');
-    return {
-        success: true,
-        text: fullText,
-        sentences: validSentences,
-        wordCount: countWords(fullText),
-        title: document.title || '',
-        rootEl: null, // no DOM highlighting for editor sites
-    };
-}
+        case 'TOGGLE_READ_MODE': {
+            const nowActive = !isReadModeEnabled();
+            chrome.storage.local.set({ readMode: nowActive }).catch(() => {});
+            updateReadMode(nowActive, getReadModeWpm());
 
-function extractPageText() {
-    if (isEditorSite()) return extractFromInnerText();
-    const rootEl = findArticleElement();
-    const rawText = extractTextFromElement(rootEl);
+            if (nowActive) {
+                // Capture audio position BEFORE stopping so read-mode starts from the
+                // same sentence the user was listening to.
+                const audioSentenceIdx = Math.max(0, audioPlayer.getCurrentSentenceIndex() ?? 0);
 
-    if (!isValidText(rawText)) {
-        return { success: false, error: 'NO_TEXT_FOUND' };
+                // Stop audio and cancel offscreen generation (separate systems).
+                audioPlayer.stop();
+                chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'STOP' }).catch(() => {});
+                chunksReady = false;
+
+                const sentences = getReadModeSentences();
+                if (sentences.length > 0) {
+                    startReadMode(sentences, audioSentenceIdx, getReadModePageUrl());
+                } else {
+                    // Sentences not yet extracted (very early click) — wait for them.
+                    setWidgetState('loading');
+                }
+            } else {
+                // Switch back to audio mode — stop read timer, restart generation.
+                stopReadMode();
+                if (lastExtractionResult) {
+                    audioPlayer.reset();
+                    chrome.runtime.sendMessage({
+                        type:      'EXTRACTION_RESULT',
+                        sentences: lastExtractionResult.sentences,
+                        wordCount: lastExtractionResult.wordCount,
+                        title:     lastExtractionResult.title,
+                        pageUrl:   lastExtractionResult.pageUrl,
+                        autoPlay:  false,
+                    }).catch(() => {});
+                    setWidgetState('loading');
+                } else {
+                    setWidgetState('loading');
+                }
+            }
+            break;
+        }
+
+        case 'SET_READ_WPM': {
+            const newWpm = adjustWpm(action.delta);
+            chrome.storage.local.set({ readModeWpm: newWpm }).catch(() => {});
+            updateReadMode(isReadModeEnabled(), newWpm);
+            // Restart timer for the current sentence at the new speed — step back one
+            // sentence so it isn't skipped (mirrors the original clearTimeout + decrement).
+            if (isReadModeEnabled() && !isReadModePaused()) {
+                const backIdx = Math.max(0, getReadModeSentenceIndex() - 1);
+                startReadMode(null, backIdx, getReadModePageUrl());
+            }
+            break;
+        }
+
+        case 'SEEK_TO':
+            audioPlayer.seekTo(action.timeSeconds);
+            break;
+
+        case 'SET_SPEED':
+            // Local: audio-player applies WSOLA at this speed
+            audioPlayer.setSpeed(action.speed);
+            // Also inform offscreen (in case it's relevant for model)
+            chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', ...action }).catch(() => {});
+            break;
+
+        case 'SWITCH_VOICE': {
+            const playerState  = audioPlayer.getState();
+            const currentIdx   = audioPlayer.getCurrentSentenceIndex();
+            const isMidGeneration = !playerState.generationDone && currentIdx >= 0;
+
+            if (isMidGeneration) {
+                // Cancel buffered future audio and requeue in new voice from current sentence
+                audioPlayer.trimAndRestartFrom(currentIdx);
+                chrome.runtime.sendMessage({
+                    type:              'WIDGET_ACTION',
+                    action:            'VOICE_SWITCH_RESTART',
+                    voice:             action.voice,
+                    fromSentenceIndex: currentIdx,
+                }).catch(() => {});
+            } else {
+                // Not generating or position unknown — just switch for next generation
+                chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', ...action }).catch(() => {});
+            }
+            break;
+        }
+
+        case 'CLOSE_WIDGET': {
+            // Stop audio locally
+            const pauseTime = audioPlayer.getPausedAtTime();
+            audioPlayer.stop();
+            clearHighlight();
+            // Tell offscreen to cancel generation + save position
+            chrome.runtime.sendMessage({
+                type:         'WIDGET_ACTION',
+                action:       'CLOSE_WIDGET',
+                pausedAtTime: pauseTime,
+            }).catch(() => {});
+            break;
+        }
+
+        case 'STOP':
+            audioPlayer.stop();
+            clearHighlight();
+            chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'STOP' }).catch(() => {});
+            break;
+
+        case 'REQUEST_DOWNLOAD':
+            // Download handled by offscreen (loads from IDB, encodes)
+            chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'REQUEST_DOWNLOAD' }).catch(() => {});
+            break;
+
+        default:
+            // Forward anything else to offscreen via SW
+            chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', ...action }).catch(() => {});
     }
-
-    const sentences = splitSentences(rawText);
-    // Allow single-word sentences (e.g. section headings like "Upwind", "Ambition")
-    // but reject truly empty or single-character fragments (".") that slip through.
-    const validSentences = sentences.filter((s) => s.text.trim().length > 1 && countWords(s.text) >= 1);
-
-    if (validSentences.length === 0) {
-        return { success: false, error: 'NO_TEXT_FOUND' };
-    }
-
-    const fullText = validSentences.map((s) => s.text).join(' ');
-
-    return {
-        success: true,
-        text: fullText,
-        sentences: validSentences,
-        wordCount: countWords(fullText),
-        title: document.title || '',
-        rootEl, // used by highlight-injector
-    };
 }
 
-// ── Message listener ────────────────────────────────────────────────────────
+// ── Message listener ──────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message.type) {
-        // ── Original extraction (direct request) ────────────────────────
+        // ── Extraction ───────────────────────────────────────────────────
         case 'EXTRACT_TEXT': {
-            console.log('[content-script] EXTRACT_TEXT — starting extraction');
+            console.log('[content-script] EXTRACT_TEXT');
             try {
                 const result = extractPageText();
-                console.log(
-                    `[content-script] extracted ${result.wordCount ?? 0} words,`,
-                    `${result.sentences?.length ?? 0} sentences`
-                );
                 sendResponse(result);
             } catch (err) {
-                console.error('[content-script] extraction error:', err);
                 sendResponse({ success: false, error: 'UNKNOWN', message: err.message });
             }
             return true;
         }
 
-        // ── Widget lifecycle ────────────────────────────────────────────
+        // ── Widget lifecycle ─────────────────────────────────────────────
         case 'SHOW_WIDGET': {
-            console.log('[content-script] SHOW_WIDGET received, initialState:', message.initialState);
+            console.log('[content-script] SHOW_WIDGET, initialState:', message.initialState);
             injectWidget();
             showWidget();
+            // Sync read mode button once storage is definitely loaded
+            storageReadyPromise.then(() => updateReadMode(isReadModeEnabled(), getReadModeWpm()));
             if (message.initialState) {
-                // If chunks are already ready, don't revert a 'paused' widget back to 'loading'.
-                // This guards against a race where SHOW_WIDGET(loading) arrives after CHUNKS_READY.
-                const effectiveState = (chunksReady && message.initialState === 'loading') ? 'paused' : message.initialState;
+                const effectiveState = (chunksReady && message.initialState === 'loading')
+                    ? 'paused' : message.initialState;
                 setWidgetState(effectiveState);
             }
             return false;
@@ -179,16 +353,197 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         // ── Highlight-only extraction for cache reload ───────────────────
         case 'EXTRACT_FOR_HIGHLIGHT': {
-            console.log('[content-script] EXTRACT_FOR_HIGHLIGHT — preparing highlighter without re-sending to offscreen');
+            console.log('[content-script] EXTRACT_FOR_HIGHLIGHT');
             try {
                 const result = extractPageText();
-                if (result.success) {
-                    if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
-                    console.log('[content-script] EXTRACT_FOR_HIGHLIGHT: highlighter ready');
+                if (result.success && result.rootEl) {
+                    prepareHighlighter(result.rootEl, result.sentences);
                 }
             } catch (err) {
                 console.error('[content-script] EXTRACT_FOR_HIGHLIGHT error:', err);
             }
+            return false;
+        }
+
+        // ── Background staging: extract + generate without auto-play ─────
+        case 'EXTRACT_AND_STAGE': {
+            chunksReady = false;
+            audioPlayer.reset();
+            setReadModePageUrl(window.location.href);
+            console.log('[content-script] EXTRACT_AND_STAGE');
+            try {
+                const result = extractPageText();
+                if (!result.success) {
+                    console.warn('[content-script] EXTRACT_AND_STAGE: no text found');
+                    return false;
+                }
+                if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
+                // Always store sentences so read mode timer can use them
+                setReadModeSentences(result.sentences);
+                lastExtractionResult = {
+                    sentences: result.sentences,
+                    wordCount: result.wordCount,
+                    title:     result.title,
+                    pageUrl:   window.location.href,
+                };
+
+                // Wait for storage to resolve before checking isReadModeEnabled() —
+                // avoids the race condition where EXTRACT_AND_STAGE fires before the
+                // chrome.storage.local.get promise has returned.
+                // Also handles the case where the user toggled read mode before
+                // sentences were available (widget showed 'loading').
+                storageReadyPromise.then(() => {
+                    if (!isReadModeEnabled()) return;
+                    const posKey = getPositionKey();
+                    chrome.storage.local.get([posKey]).then(r => {
+                        // Only start if read mode is still active (user may have toggled back)
+                        if (isReadModeEnabled()) {
+                            startReadMode(result.sentences, r[posKey] ?? 0, window.location.href);
+                        }
+                    }).catch(() => {
+                        if (isReadModeEnabled()) startReadMode(result.sentences, 0, window.location.href);
+                    });
+                });
+
+                chrome.runtime.sendMessage({
+                    type:      'EXTRACTION_RESULT',
+                    sentences: result.sentences,
+                    wordCount: result.wordCount,
+                    title:     result.title,
+                    pageUrl:   window.location.href,
+                    autoPlay:  false,
+                });
+            } catch (err) {
+                console.error('[content-script] EXTRACT_AND_STAGE error:', err);
+            }
+            return false;
+        }
+
+        case 'EXTRACT_AND_PLAY': {
+            chunksReady = false;
+            audioPlayer.reset();
+            setReadModePageUrl(window.location.href);
+            console.log('[content-script] EXTRACT_AND_PLAY');
+            try {
+                const result = extractPageText();
+                if (!result.success) {
+                    updateStatus('No text found on this page.');
+                    return false;
+                }
+                if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
+                // Populate sentences so switching to read mode mid-playback works
+                setReadModeSentences(result.sentences);
+                lastExtractionResult = {
+                    sentences: result.sentences,
+                    wordCount: result.wordCount,
+                    title:     result.title,
+                    pageUrl:   window.location.href,
+                };
+                chrome.runtime.sendMessage({
+                    type:      'EXTRACTION_RESULT',
+                    sentences: result.sentences,
+                    wordCount: result.wordCount,
+                    title:     result.title,
+                    pageUrl:   window.location.href,
+                });
+            } catch (err) {
+                updateStatus('Error extracting text.');
+            }
+            return false;
+        }
+
+        // ── Selection TTS ────────────────────────────────────────────────
+        case 'EXTRACT_SELECTION': {
+            chunksReady = false;
+            audioPlayer.reset();
+            const selSentences = splitSentences(message.text);
+            const validSel = selSentences.filter(s => s.text.trim().length > 1 && countWords(s.text) >= 1);
+            if (validSel.length === 0) return false;
+            const selFullText = validSel.map(s => s.text).join(' ');
+            chrome.runtime.sendMessage({
+                type:      'EXTRACTION_RESULT',
+                sentences: validSel,
+                wordCount: countWords(selFullText),
+                title:     document.title || '',
+            });
+            return false;
+        }
+
+        // ── Audio chunks from offscreen (via SW relay) ───────────────────
+        case 'AUDIO_CHUNK_READY': {
+            // In read mode audio is suppressed — generation runs in background for caching
+            if (isReadModeEnabled()) return false;
+            audioPlayer.queueChunk({
+                samples:           message.samples,
+                sampleRate:        message.sampleRate,
+                sentenceIndex:     message.sentenceIndex,
+                countAsChunk:      message.countAsChunk,
+                isMidChunk:        message.isMidChunk,
+                endsWithParagraph: message.endsWithParagraph,
+                endsWithSection:   message.endsWithSection,
+                pauseAfterMs:      message.pauseAfterMs,
+            });
+            return false;
+        }
+
+        // ── Cached audio loaded by offscreen from IDB (streaming) ────────
+        // Offscreen streams entries one-by-one to avoid Chrome's 64MiB message
+        // limit. We buffer them here and hand them to the audio player on DONE.
+        case 'CACHE_LOAD_START': {
+            console.log('[content-script] CACHE_LOAD_START:', message.count, 'chunks');
+            pendingCacheEntries = [];
+            pendingCacheResume  = message.resumePosition ?? 0;
+            pendingCacheTitle   = message.title ?? '';
+            return false;
+        }
+
+        case 'CACHE_LOAD_CHUNK': {
+            pendingCacheEntries.push({
+                data:          message.data,
+                sampleRate:    message.sampleRate,
+                countAsChunk:  message.countAsChunk,
+                sentenceIndex: message.sentenceIndex,
+                pauseAfter:    message.pauseAfter,
+            });
+            return false;
+        }
+
+        case 'CACHE_LOAD_DONE': {
+            console.log('[content-script] CACHE_LOAD_DONE:', pendingCacheEntries.length, 'chunks buffered');
+            audioPlayer.loadCachedAudio(pendingCacheEntries, pendingCacheResume);
+            chunksReady = true;
+            setWidgetState('paused');
+            updateStatus(`"${pendingCacheTitle}" ready to play`);
+            markGenerationDone();
+            pendingCacheEntries = [];
+            // If a GC-triggered cache reload had a pending seek target, apply it now
+            if (pendingSeekAfterReload !== null) {
+                const seekTime = pendingSeekAfterReload;
+                pendingSeekAfterReload = null;
+                audioPlayer.seekTo(seekTime);
+            }
+            return false;
+        }
+
+        // ── Legacy single-message cache path (kept for forward compat) ───
+        case 'CACHE_LOADED': {
+            console.log('[content-script] CACHE_LOADED:', message.entries?.length, 'entries');
+            audioPlayer.loadCachedAudio(message.entries, message.resumePosition);
+            chunksReady = true;
+            setWidgetState('paused');
+            updateStatus(`"${message.title}" ready to play`);
+            markGenerationDone();
+            return false;
+        }
+
+        case 'CACHE_MISS': {
+            console.warn('[content-script] CACHE_MISS — starting fresh extraction');
+            return false;
+        }
+
+        // ── Generation lifecycle from offscreen ──────────────────────────
+        case 'GENERATION_DONE': {
+            audioPlayer.markGenerationDone();
             return false;
         }
 
@@ -198,118 +553,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'CHUNKS_READY': {
-            console.log('[content-script] CHUNKS_READY — switching widget to paused/play state');
+            // Legacy — kept for compatibility during transition
             chunksReady = true;
-            // Don't overwrite 'playing' with 'paused' — happens when RESTORE_SESSION
-            // auto-plays and CHUNKS_READY arrives after PLAYBACK_STATE:'playing'.
             if (widgetState !== 'playing') {
                 setWidgetState('paused');
-                updateStatus('Ready — click to play');
+                updateStatus('Ready \u2014 click to play');
             }
             return false;
         }
 
-        // ── Background staging (icon click): extract + generate without auto-play
-        case 'EXTRACT_AND_STAGE': {
-            chunksReady = false; // new generation starting — reset guard
-            console.log('[content-script] EXTRACT_AND_STAGE — extracting for background generation');
-            try {
-                const result = extractPageText();
-                if (!result.success) {
-                    console.warn('[content-script] EXTRACT_AND_STAGE: no text found');
-                    return false;
-                }
-                console.log(
-                    `[content-script] extracted ${result.wordCount} words,`,
-                    `${result.sentences.length} sentences (staged)`
-                );
-                if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
-                chrome.runtime.sendMessage({
-                    type: 'EXTRACTION_RESULT',
-                    sentences: result.sentences,
-                    wordCount: result.wordCount,
-                    title: result.title,
-                    pageUrl: window.location.href,
-                    autoPlay: false,
-                });
-            } catch (err) {
-                console.error('[content-script] EXTRACT_AND_STAGE error:', err);
-            }
-            return false;
-        }
-
-        case 'EXTRACT_AND_PLAY': {
-            chunksReady = false; // new generation starting — reset guard
-            console.log('[content-script] EXTRACT_AND_PLAY — extracting and sending to offscreen');
-            try {
-                const result = extractPageText();
-                if (!result.success) {
-                    updateStatus('No text found on this page.');
-                    return false;
-                }
-                console.log(
-                    `[content-script] extracted ${result.wordCount} words,`,
-                    `${result.sentences.length} sentences`
-                );
-                if (result.rootEl) prepareHighlighter(result.rootEl, result.sentences);
-                // Send extraction result to service worker → offscreen
-                chrome.runtime.sendMessage({
-                    type: 'EXTRACTION_RESULT',
-                    sentences: result.sentences,
-                    wordCount: result.wordCount,
-                    title: result.title,
-                    pageUrl: window.location.href,
-                });
-            } catch (err) {
-                console.error('[content-script] extraction error:', err);
-                updateStatus('Error extracting text.');
-            }
-            return false;
-        }
-
-        // ── Selection TTS: split selected text and send as proper sentences ──
-        case 'EXTRACT_SELECTION': {
-            chunksReady = false;
-            const selSentences = splitSentences(message.text);
-            const validSel = selSentences.filter(s => s.text.trim().length > 1 && countWords(s.text) >= 1);
-            if (validSel.length === 0) return false;
-            const selFullText = validSel.map(s => s.text).join(' ');
-            chrome.runtime.sendMessage({
-                type: 'EXTRACTION_RESULT',
-                sentences: validSel,
-                wordCount: countWords(selFullText),
-                title: document.title || '',
-                // autoPlay defaults to true (same as icon-click EXTRACT_AND_PLAY)
-                // No pageUrl — selections don't pollute the page cache
-            });
-            return false;
-        }
-
-        // ── State updates from offscreen (via service worker) ───────────
-        case 'SENTENCE_PLAYING': {
-            highlightSentence(message.index);
-            return false;
-        }
-
+        // ── State updates from offscreen (via SW relay) ──────────────────
         case 'PLAYBACK_STATE': {
             console.log('[content-script] PLAYBACK_STATE:', message.state);
-            // Once chunks are ready, ignore 'loading' state (e.g. from voice switch LOADING_PROGRESS)
-            // to prevent the play button from reverting back to a spinner.
-            if (message.state === 'loading' && chunksReady) {
-                return false;
+            // Only process 'loading' state from offscreen (model loading, etc.)
+            // Play/pause/done states are now driven by the local audio player
+            if (message.state === 'loading' && !chunksReady) {
+                setWidgetState('loading');
             }
-            if (message.state === 'stopped' || message.state === 'done') {
-                chunksReady = false;
-                clearHighlight();
-            }
-            setWidgetState(message.state);
             return false;
         }
 
         case 'PROGRESS_UPDATE': {
-            if (message.current != null && message.total != null) {
-                updateSeeker(message.current, message.total);
-            }
+            // Only process progress from offscreen during model loading (pct from LOADING_PROGRESS).
+            // Playback progress is driven locally by audio-player.js.
             return false;
         }
 
@@ -319,14 +585,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'MODEL_READY': {
-            // Model loaded — generation will start shortly. Do NOT show play button here;
-            // only CHUNKS_READY should transition the widget from loading to paused.
-            console.log('[content-script] MODEL_READY received');
+            console.log('[content-script] MODEL_READY');
             return false;
         }
 
-        case 'GENERATION_DONE': {
-            // Generation complete; playback continues until audio buffer drains
+        case 'SENTENCE_PLAYING': {
+            // Legacy — kept for transition. In new arch, audio-player fires directly.
+            highlightSentence(message.index);
             return false;
         }
 
@@ -340,7 +605,32 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             updateStatus(`Error: ${message.detail || message.code}`);
             return false;
         }
+
+        // ── SW queries content script for playback state ─────────────────
+        case 'QUERY_PLAYBACK_STATE': {
+            const state = audioPlayer.getState();
+            sendResponse({
+                hasAudio:          state.hasAudio,
+                isPlaying:         state.isPlaying,
+                generationDone:    state.generationDone,
+                lastSentenceIndex: state.lastSentenceIndex,
+                playbackStarted:   state.playbackStarted,
+            });
+            return true;
+        }
     }
 
     return false;
+});
+
+// ── Page unload cleanup ───────────────────────────────────────────────────────
+// Prevents stale incomplete chunks from accumulating in IDB across page loads.
+
+window.addEventListener('pagehide', () => {
+    chrome.runtime.sendMessage({ type: 'PAGE_UNLOAD', url: location.href }).catch(() => {});
+    // Save read mode bookmark on unload if a session is active
+    if (isReadModeEnabled() && getReadModeSentences().length > 0) {
+        chrome.storage.local.set({ [getPositionKey()]: getReadModeSentenceIndex() }).catch(() => {});
+    }
+    // Read mode timer cleanup is handled by the browser — no need for explicit clearTimeout
 });

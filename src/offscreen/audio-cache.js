@@ -8,7 +8,16 @@
 // v4: audio data stored as Int16 (2 bytes/sample) instead of Float32 (4 bytes/sample) — 2× smaller.
 
 const DB_NAME      = 'kokoro-tts-cache';
-const DB_VERSION   = 4; // v4: Int16 audio storage (2× smaller than Float32)
+const DB_VERSION   = 4;
+// Schema history:
+//   v1 (initial): audio store only (Float32 data)
+//   v2: added positions store for playback bookmark
+//   v3: added chunks store for incremental write during generation
+//   v4 (current): Int16 audio storage (2× smaller than Float32); added jobs store for resume
+
+// Maximum number of completed audio cache entries to keep in IDB.
+// Oldest entries (by generatedAt) are pruned when this limit is exceeded.
+const MAX_CACHE_ENTRIES = 20;
 const AUDIO_STORE  = 'audio';
 const CHUNKS_STORE = 'chunks';
 const POS_STORE    = 'positions';
@@ -72,6 +81,36 @@ function openDb() {
 // ── Complete audio store (unchanged API) ────────────────────────────────────
 
 /**
+ * Delete the oldest cache entries until the total count is within MAX_CACHE_ENTRIES.
+ * Called asynchronously after saveToCache so it does not block the caller.
+ */
+async function enforceCacheCap() {
+    const db = await openDb();
+    return new Promise((resolve) => {
+        const tx  = db.transaction(AUDIO_STORE, 'readwrite');
+        const req = tx.objectStore(AUDIO_STORE).getAll();
+        req.onsuccess = (e) => {
+            const rows = e.target.result || [];
+            if (rows.length <= MAX_CACHE_ENTRIES) {
+                // Already within limit — nothing to do
+                db.close();
+                resolve();
+                return;
+            }
+            // Sort ascending by generatedAt so oldest entries come first
+            rows.sort((a, b) => a.generatedAt - b.generatedAt);
+            const toDelete = rows.slice(0, rows.length - MAX_CACHE_ENTRIES);
+            const store = tx.objectStore(AUDIO_STORE);
+            for (const row of toDelete) {
+                store.delete(row.url);
+            }
+        };
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror    = () => { db.close(); resolve(); };
+    });
+}
+
+/**
  * Save complete audio entries to cache (called on GENERATION_DONE).
  * entries: [{ data: ArrayBuffer, sampleRate, countAsChunk, sentenceIndex, pauseAfter }]
  */
@@ -83,12 +122,14 @@ export async function saveToCache(url, { title, entries }) {
         ...e,
         data: float32ToInt16Buffer(e.data),
     }));
-    return new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
         const tx = db.transaction(AUDIO_STORE, 'readwrite');
         tx.objectStore(AUDIO_STORE).put({ url: key, title, generatedAt: Date.now(), entries: compressed });
         tx.oncomplete = () => { db.close(); resolve(); };
         tx.onerror    = (e) => { db.close(); reject(e.target.error); };
     });
+    // Enforce the entry cap asynchronously — don't block the caller
+    enforceCacheCap().catch(() => {});
 }
 
 /**
