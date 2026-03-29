@@ -1,8 +1,10 @@
 // offscreen.js — TTS generation engine (no audio playback)
 //
-// Hosts the TTS Web Worker, manages model lifecycle, writes chunks to IndexedDB,
-// and forwards generated audio to the content script (via SW relay) for playback.
-// All AudioContext / playback code has been moved to content/audio-player.js.
+// Hosts 1 or 2 TTS Web Workers (turbo mode), manages model lifecycle,
+// writes chunks to IndexedDB via a reorder buffer that guarantees
+// sentence-order delivery, and forwards generated audio to the content
+// script (via SW relay) for playback.
+// All AudioContext / playback code lives in content/audio-player.js.
 
 import {
     saveToCache, loadFromCache, checkCacheExists, clearExpired, normUrl,
@@ -17,9 +19,18 @@ function notifySW(message) {
 }
 
 // ── Worker state ─────────────────────────────────────────────────────────────
-let ttsWorker        = null;
-let modelReady       = false;
-let currentVoiceName = null;
+let turboMode          = true;   // default ON — dual workers
+let workers            = [];     // [Worker] or [Worker, Worker]
+let workersReady       = 0;      // count of workers that sent MODEL_READY
+let allWorkersReady    = false;
+let currentVoiceName   = null;
+
+// ── Progress throttle state ──────────────────────────────────────────────────
+// fetchToOpfsWithProgress fires onProgress on every HTTP stream chunk, which
+// without throttling causes ~33K SW messages per model download. We track the
+// last relayed stage + rounded pct and only forward when something changes.
+let lastProgressStage = null;
+let lastProgressPct   = -1;
 
 // ── Generation state ─────────────────────────────────────────────────────────
 let currentGenId          = 0;
@@ -29,12 +40,29 @@ let generationDone        = false;
 let chunkSaveIndex        = 0;
 let lastSentenceGenerated = -1;
 let currentUserSpeed      = 1.0;
+let allSentences          = [];  // full sentence list for current generation
 
 // Pending extraction queue — holds messages that arrived before the model was ready.
 // On MODEL_READY the most-recent entry is started and earlier ones are discarded.
 let pendingExtractionQueue = [];
 // Deferred generation resume — queued while model is still loading after restart
 let pendingResume = null;
+
+// ── Reorder buffer ───────────────────────────────────────────────────────────
+// With dual workers, chunks arrive out of sentence-order. The reorder buffer
+// collects chunks keyed by sentenceIndex and flushes them in strict ascending
+// order once each sentence is marked complete (SENTENCE_COMPLETE from worker).
+const reorderBuffer = new Map(); // sentenceIndex → { chunks: [], complete: false }
+let nextFlushIndex  = 0;
+
+// ── Worker completion tracking ───────────────────────────────────────────────
+let activeWorkerCount = 0;  // workers with active GENERATE_AUDIO tasks
+let workersDoneCount  = 0;  // workers that sent GENERATION_DONE for current genId
+
+// Per-worker sentence assignments for the current generation.
+// Used to re-dispatch work to a recreated worker after a crash.
+// Map<workerIndex, { sentences: [], indices: [], totalSentences: number }>
+const workerAssignments = new Map();
 
 // Pause durations — must stay in sync with audio-player.js for IDB entries
 const PAUSE_SECTION   = 1.20;
@@ -59,22 +87,84 @@ const STAGE_LABELS = {
 
 // ── TTS Worker lifecycle ─────────────────────────────────────────────────────
 
-function initWorker(voice) {
-    const workerUrl = chrome.runtime.getURL('tts-worker.js');
-    ttsWorker = new Worker(workerUrl);
+/**
+ * Build the LOAD_MODEL message shared by all workers.
+ */
+function buildLoadModelMsg(voice) {
+    return {
+        type:               'LOAD_MODEL',
+        voice,
+        wasmPaths:          chrome.runtime.getURL('wasm/'),
+        remoteModelUrl:     HF_MODEL_URL,
+        remoteVoiceBaseUrl: HF_VOICE_BASE_URL,
+        modelUrl:           chrome.runtime.getURL('models/kokoro-v1.0.onnx'),
+        voiceBaseUrl:       chrome.runtime.getURL('models/voices/'),
+    };
+}
 
-    ttsWorker.onmessage = (event) => {
-        const { type, ...payload } = event.data;
+/**
+ * Initialise 1 or 2 TTS workers depending on turbo mode.
+ * Both workers load the model in parallel for fastest start-up.
+ */
+function initWorkers(voice) {
+    const workerCount = turboMode ? 2 : 1;
+    workers           = [];
+    workersReady      = 0;
+    allWorkersReady   = false;
+    lastProgressStage = null;
+    lastProgressPct   = -1;
 
-        switch (type) {
-            case 'LOADING_PROGRESS':
-                notifySW({ type: 'STATUS_UPDATE', text: STAGE_LABELS[payload.stage] ?? 'Loading\u2026', relayToContent: true, relayToOnboarding: true });
-                notifySW({ type: 'PROGRESS_UPDATE', pct: payload.pct, relayToContent: true, relayToOnboarding: true });
-                notifySW({ type: 'PLAYBACK_STATE', state: 'loading', relayToContent: true });
-                break;
+    const workerUrl    = chrome.runtime.getURL('tts-worker.js');
+    const loadModelMsg = buildLoadModelMsg(voice);
 
-            case 'MODEL_READY':
-                modelReady = true;
+    for (let w = 0; w < workerCount; w++) {
+        const worker      = new Worker(workerUrl);
+        const workerIndex = w;
+
+        worker.onmessage = (event) => handleWorkerMessage(workerIndex, event);
+        worker.onerror   = (err)  => handleWorkerError(workerIndex, err);
+        worker.onmessageerror = (err) => {
+            console.error(`[offscreen] worker ${workerIndex} message deserialise error:`, err);
+        };
+
+        workers.push(worker);
+        worker.postMessage(loadModelMsg);
+    }
+
+    console.log(`[offscreen] initialised ${workerCount} worker(s) (turbo=${turboMode})`);
+    notifySW({ type: 'STATUS_UPDATE', text: 'Loading model\u2026', relayToContent: true, relayToOnboarding: true });
+    notifySW({ type: 'PLAYBACK_STATE', state: 'loading', relayToContent: true });
+}
+
+// ── Worker message dispatch ──────────────────────────────────────────────────
+
+function handleWorkerMessage(workerIndex, event) {
+    const { type, ...payload } = event.data;
+
+    switch (type) {
+        case 'LOADING_PROGRESS':
+            // Relay progress from worker 0 only, throttled to stage changes or
+            // ≥1% pct change — fetchToOpfsWithProgress fires on every HTTP chunk
+            // which would otherwise flood the SW with ~33K messages per download.
+            if (workerIndex === 0) {
+                const pctRounded = Math.round(payload.pct);
+                const stageChanged = payload.stage !== lastProgressStage;
+                const pctChanged   = pctRounded !== lastProgressPct;
+                if (stageChanged || pctChanged) {
+                    lastProgressStage = payload.stage;
+                    lastProgressPct   = pctRounded;
+                    notifySW({ type: 'STATUS_UPDATE', text: STAGE_LABELS[payload.stage] ?? 'Loading\u2026', relayToContent: true, relayToOnboarding: true });
+                    notifySW({ type: 'PROGRESS_UPDATE', pct: payload.pct, relayToContent: true, relayToOnboarding: true });
+                    notifySW({ type: 'PLAYBACK_STATE', state: 'loading', relayToContent: true });
+                }
+            }
+            break;
+
+        case 'MODEL_READY': {
+            workersReady++;
+            console.log(`[offscreen] worker ${workerIndex} model ready (${workersReady}/${workers.length})`);
+            if (workersReady >= workers.length) {
+                allWorkersReady = true;
                 notifySW({ type: 'PROGRESS_UPDATE', pct: 0, relayToContent: true, relayToOnboarding: true });
                 notifySW({ type: 'MODEL_READY', relayToContent: true, relayToOnboarding: true });
                 if (pendingExtractionQueue.length > 0) {
@@ -89,143 +179,320 @@ function initWorker(voice) {
                 } else {
                     notifySW({ type: 'STATUS_UPDATE', text: 'Ready', relayToContent: true, relayToOnboarding: true });
                 }
-                break;
+            }
+            break;
+        }
 
-            case 'PHONEMES_READY':
-                console.log(`[offscreen] phonemes [${payload.index + 1}/${payload.total}]: "${payload.phonemes}"`);
-                break;
+        case 'PHONEMES_READY':
+            console.log(`[offscreen] phonemes [${payload.index + 1}/${payload.total}]: "${payload.phonemes}"`);
+            break;
 
-            case 'AUDIO_CHUNK': {
-                const { genId, index, total, samples, sampleRate,
-                        endsWithParagraph, endsWithSection, isMidChunk,
-                        countAsChunk, pauseAfterMs } = payload;
-                if (genId !== currentGenId) {
-                    console.log(`[offscreen] dropping stale chunk (genId ${genId} \u2260 ${currentGenId})`);
-                    break;
-                }
-                console.log(`[offscreen] audio chunk ${index + 1}/${total}: ${samples.length} samples (${(samples.length / sampleRate).toFixed(2)}s)`);
+        case 'AUDIO_CHUNK':
+            handleAudioChunk(workerIndex, payload);
+            break;
 
-                // Track highest sentence index for resume
-                if (!isMidChunk && index > lastSentenceGenerated) {
-                    lastSentenceGenerated = index;
-                }
+        case 'SENTENCE_COMPLETE':
+            handleSentenceComplete(workerIndex, payload);
+            break;
 
-                // Calculate pause for IDB entry
-                const pause = pauseAfterMs !== undefined
-                    ? pauseAfterMs / 1000
-                    : isMidChunk        ? 0
-                    : endsWithSection   ? PAUSE_SECTION
-                    : endsWithParagraph ? PAUSE_PARAGRAPH
-                    : PAUSE_SENTENCE;
+        case 'GENERATION_DONE':
+            handleWorkerGenerationDone(workerIndex, payload);
+            break;
 
-                // Persist chunk to IndexedDB (survives offscreen termination)
-                if (currentPageUrl) {
-                    const idx = chunkSaveIndex++;
-                    const buf = samples.buffer.slice(
-                        samples.byteOffset,
-                        samples.byteOffset + samples.byteLength
-                    );
-                    appendChunk(currentPageUrl, idx, {
-                        data: buf, sampleRate, countAsChunk,
-                        sentenceIndex: index, pauseAfter: pause,
-                    }).catch(() => {});
-                }
+        case 'VOICE_READY':
+            console.log(`[offscreen] worker ${workerIndex} voice switched to`, payload.voice);
+            // Relay once to avoid duplicate UI flicker
+            if (workerIndex === 0) {
+                notifySW({ type: 'VOICE_READY', voice: payload.voice, relayToContent: true });
+            }
+            break;
 
-                // Forward audio data to content script via SW relay.
-                // Convert Float32Array → regular Array for chrome messaging
-                // (typed arrays don't survive JSON serialization in extension APIs).
-                notifySW({
-                    type:              'AUDIO_CHUNK_READY',
-                    relayToContent:    true,
-                    samples:           Array.from(samples),
-                    sampleRate,
-                    sentenceIndex:     index,
-                    total,
-                    countAsChunk,
-                    isMidChunk,
-                    endsWithParagraph,
-                    endsWithSection,
-                    pauseAfterMs,
-                });
-                break;
+        case 'DOWNLOAD_FAILED':
+            console.error(`[offscreen] worker ${workerIndex} download failed:`, payload.detail);
+            notifySW({ type: 'ERROR', code: 'WORKER_ERROR', detail: payload.detail || 'Model download failed', relayToContent: true });
+            break;
+
+        case 'ERROR':
+            console.error(`[offscreen] worker ${workerIndex} error:`, payload.code, payload.detail);
+            notifySW({ type: 'ERROR', code: payload.code, detail: payload.detail, relayToContent: true });
+            break;
+
+        default:
+            console.log(`[offscreen] worker ${workerIndex} message:`, type, payload);
+    }
+}
+
+function handleWorkerError(workerIndex, err) {
+    console.error(`[offscreen] worker ${workerIndex} crash:`, err.message);
+    notifySW({ type: 'ERROR', code: 'WORKER_CRASHED', detail: err.message || 'Worker crashed' });
+
+    // Recreate the crashed worker and reload model
+    const workerUrl = chrome.runtime.getURL('tts-worker.js');
+    const newWorker = new Worker(workerUrl);
+    const idx       = workerIndex;
+
+    newWorker.onmessage      = (event) => handleWorkerMessage(idx, event);
+    newWorker.onerror        = (err2)  => handleWorkerError(idx, err2);
+    newWorker.onmessageerror = (err2)  => {
+        console.error(`[offscreen] worker ${idx} message deserialise error:`, err2);
+    };
+
+    workers[workerIndex] = newWorker;
+    workersReady         = Math.max(0, workersReady - 1);
+    allWorkersReady      = false;
+
+    // The assignment for this worker is saved in workerAssignments. Once
+    // MODEL_READY fires for the new worker, re-dispatch its sentences.
+    // Until then, decrement activeWorkerCount so GENERATION_DONE can still
+    // fire from the surviving worker(s) if this worker had no pending work.
+    const savedAssignment = workerAssignments.get(workerIndex);
+    if (!savedAssignment || savedAssignment.sentences.length === 0) {
+        // No sentences were assigned — the surviving workers can still finish
+        activeWorkerCount = Math.max(0, activeWorkerCount - 1);
+    }
+    // If there are sentences to redo, activeWorkerCount stays the same:
+    // the new worker will re-join and eventually send GENERATION_DONE.
+
+    // Store the genId at crash time so the redispatch is scoped correctly
+    const crashGenId = currentGenId;
+    const originalOnMessage = newWorker.onmessage;
+    newWorker.onmessage = (event) => {
+        if (event.data?.type === 'MODEL_READY' && crashGenId === currentGenId && savedAssignment?.sentences.length > 0) {
+            console.log(`[offscreen] worker ${idx} recovered — re-dispatching ${savedAssignment.sentences.length} sentences`);
+            newWorker.postMessage({
+                type:            'GENERATE_AUDIO',
+                sentences:       savedAssignment.sentences,
+                sentenceIndices: savedAssignment.indices,
+                totalSentences:  savedAssignment.totalSentences,
+                speed:           currentUserSpeed,
+                voice:           currentVoiceName,
+                genId:           currentGenId,
+            });
+        }
+        originalOnMessage(event);
+    };
+
+    newWorker.postMessage(buildLoadModelMsg(currentVoiceName));
+}
+
+// ── Reorder buffer ───────────────────────────────────────────────────────────
+
+/**
+ * Store an AUDIO_CHUNK in the reorder buffer (keyed by sentenceIndex).
+ */
+function handleAudioChunk(workerIndex, payload) {
+    const { genId, index, total, samples, sampleRate,
+            endsWithParagraph, endsWithSection, isMidChunk,
+            countAsChunk, pauseAfterMs } = payload;
+
+    if (genId !== currentGenId) {
+        console.log(`[offscreen] dropping stale chunk from worker ${workerIndex} (genId ${genId} \u2260 ${currentGenId})`);
+        return;
+    }
+
+    console.log(`[offscreen] worker ${workerIndex} chunk sentence=${index + 1}/${total}: ${samples.length} samples (${(samples.length / sampleRate).toFixed(2)}s)`);
+
+    // Calculate pause for IDB entry
+    const pause = pauseAfterMs !== undefined
+        ? pauseAfterMs / 1000
+        : isMidChunk        ? 0
+        : endsWithSection   ? PAUSE_SECTION
+        : endsWithParagraph ? PAUSE_PARAGRAPH
+        : PAUSE_SENTENCE;
+
+    if (!reorderBuffer.has(index)) {
+        reorderBuffer.set(index, { chunks: [], complete: false });
+    }
+    reorderBuffer.get(index).chunks.push({
+        samples, sampleRate, index, total,
+        endsWithParagraph, endsWithSection, isMidChunk,
+        countAsChunk, pauseAfterMs, pause,
+    });
+}
+
+/**
+ * Mark a sentence as fully generated (all AUDIO_CHUNKs posted).
+ * Triggers a flush attempt.
+ */
+function handleSentenceComplete(workerIndex, payload) {
+    const { index, genId } = payload;
+    if (genId !== currentGenId) return;
+
+    console.log(`[offscreen] worker ${workerIndex} sentence ${index + 1} complete`);
+
+    if (!reorderBuffer.has(index)) {
+        reorderBuffer.set(index, { chunks: [], complete: true });
+    } else {
+        reorderBuffer.get(index).complete = true;
+    }
+
+    flushReorderBuffer();
+}
+
+/**
+ * Flush all consecutive complete sentences starting from nextFlushIndex.
+ * Each chunk is persisted to IDB and relayed to the content script.
+ */
+function flushReorderBuffer() {
+    while (reorderBuffer.has(nextFlushIndex)) {
+        const entry = reorderBuffer.get(nextFlushIndex);
+        if (!entry.complete) break;
+
+        for (const chunk of entry.chunks) {
+            // Track highest sentence index for resume
+            if (!chunk.isMidChunk && chunk.index > lastSentenceGenerated) {
+                lastSentenceGenerated = chunk.index;
             }
 
-            case 'GENERATION_DONE':
-                if (payload.genId !== currentGenId) break;
-                generationDone = true;
-                notifySW({ type: 'GENERATION_DONE', relayToContent: true });
-                console.log(`[offscreen] all ${payload.total} sentences generated`);
-                // Save complete audio to IDB cache
-                (async () => {
-                    try {
-                        if (currentPageUrl) {
-                            const chunks = await loadChunks(currentPageUrl);
-                            if (chunks.length > 0) {
-                                const entries = chunks.map(c => ({
-                                    data:          c.data,
-                                    sampleRate:    c.sampleRate,
-                                    countAsChunk:  c.countAsChunk,
-                                    sentenceIndex: c.sentenceIndex,
-                                    pauseAfter:    c.pauseAfter,
-                                }));
-                                await saveToCache(currentPageUrl, { title: articleTitle, entries });
-                                console.log('[offscreen] saved to cache for', currentPageUrl);
-                                // Individual chunks + job now redundant
-                                clearChunks(currentPageUrl).catch(() => {});
-                                deleteGenerationJob(currentPageUrl).catch(() => {});
-                            }
-                        }
-                    } catch (err) {
-                        console.error('[offscreen] cache save failed:', err);
-                    } finally {
-                        notifySW({ type: 'DOWNLOAD_READY', relayToContent: true });
-                    }
-                })();
-                break;
+            // Persist chunk to IndexedDB (survives offscreen termination)
+            if (currentPageUrl) {
+                const idx = chunkSaveIndex++;
+                const buf = chunk.samples.buffer.slice(
+                    chunk.samples.byteOffset,
+                    chunk.samples.byteOffset + chunk.samples.byteLength
+                );
+                appendChunk(currentPageUrl, idx, {
+                    data: buf, sampleRate: chunk.sampleRate, countAsChunk: chunk.countAsChunk,
+                    sentenceIndex: chunk.index, pauseAfter: chunk.pause,
+                }).catch(() => {});
+            }
 
-            case 'VOICE_READY':
-                console.log('[offscreen] voice switched to', payload.voice);
-                notifySW({ type: 'VOICE_READY', voice: payload.voice, relayToContent: true });
-                break;
-
-            case 'DOWNLOAD_FAILED':
-                console.error('[offscreen] model download failed:', payload.detail);
-                notifySW({ type: 'ERROR', code: 'WORKER_ERROR', detail: payload.detail || 'Model download failed', relayToContent: true });
-                break;
-
-            case 'ERROR':
-                console.error('[offscreen] worker error:', payload.code, payload.detail);
-                notifySW({ type: 'ERROR', code: payload.code, detail: payload.detail, relayToContent: true });
-                break;
-
-            default:
-                console.log('[offscreen] worker message:', type, payload);
+            // Forward audio data to content script via SW relay.
+            // Use Array.from() — the message passes through two structured-clone hops
+            // (offscreen → SW → content script via tabs.sendMessage). ArrayBuffer
+            // arrives detached/zero-length on the second hop; plain arrays survive intact.
+            notifySW({
+                type:              'AUDIO_CHUNK_READY',
+                relayToContent:    true,
+                samples:           Array.from(chunk.samples),
+                sampleRate:        chunk.sampleRate,
+                sentenceIndex:     chunk.index,
+                total:             chunk.total,
+                countAsChunk:      chunk.countAsChunk,
+                isMidChunk:        chunk.isMidChunk,
+                endsWithParagraph: chunk.endsWithParagraph,
+                endsWithSection:   chunk.endsWithSection,
+                pauseAfterMs:      chunk.pauseAfterMs,
+            });
         }
-    };
 
-    ttsWorker.onerror = (err) => {
-        console.error('[offscreen] worker crash:', err.message);
-        notifySW({ type: 'ERROR', code: 'WORKER_CRASHED', detail: err.message || 'Worker crashed' });
-        ttsWorker = null;
-        modelReady = false;
-        initWorker(currentVoiceName);
-    };
+        // Mark as flushed even if the sentence produced no chunks (skipped)
+        if (entry.chunks.length === 0 && nextFlushIndex > lastSentenceGenerated) {
+            lastSentenceGenerated = nextFlushIndex;
+        }
 
-    ttsWorker.onmessageerror = (err) => {
-        console.error('[offscreen] worker message deserialise error:', err);
-    };
+        reorderBuffer.delete(nextFlushIndex);
+        nextFlushIndex++;
+    }
+}
 
-    notifySW({ type: 'STATUS_UPDATE', text: 'Loading model\u2026', relayToContent: true, relayToOnboarding: true });
-    notifySW({ type: 'PLAYBACK_STATE', state: 'loading', relayToContent: true });
-    ttsWorker.postMessage({
-        type:               'LOAD_MODEL',
-        voice,
-        wasmPaths:          chrome.runtime.getURL('wasm/'),
-        remoteModelUrl:     HF_MODEL_URL,
-        remoteVoiceBaseUrl: HF_VOICE_BASE_URL,
-        modelUrl:           chrome.runtime.getURL('models/kokoro-v1.0.onnx'),
-        voiceBaseUrl:       chrome.runtime.getURL('models/voices/'),
-    });
+// ── Worker generation-done tracking ──────────────────────────────────────────
+
+function handleWorkerGenerationDone(workerIndex, payload) {
+    if (payload.genId !== currentGenId) return;
+
+    workersDoneCount++;
+    console.log(`[offscreen] worker ${workerIndex} generation done (${workersDoneCount}/${activeWorkerCount})`);
+
+    if (workersDoneCount >= activeWorkerCount) {
+        generationDone = true;
+        notifySW({ type: 'GENERATION_DONE', relayToContent: true });
+        console.log('[offscreen] all workers done — generation complete');
+
+        // Save complete audio to IDB cache
+        (async () => {
+            try {
+                if (currentPageUrl) {
+                    const chunks = await loadChunks(currentPageUrl);
+                    if (chunks.length > 0) {
+                        const entries = chunks.map(c => ({
+                            data:          c.data,
+                            sampleRate:    c.sampleRate,
+                            countAsChunk:  c.countAsChunk,
+                            sentenceIndex: c.sentenceIndex,
+                            pauseAfter:    c.pauseAfter,
+                        }));
+                        await saveToCache(currentPageUrl, { title: articleTitle, entries });
+                        console.log('[offscreen] saved to cache for', currentPageUrl);
+                        // Individual chunks + job now redundant
+                        clearChunks(currentPageUrl).catch(() => {});
+                        deleteGenerationJob(currentPageUrl).catch(() => {});
+                    }
+                }
+            } catch (err) {
+                console.error('[offscreen] cache save failed:', err);
+            } finally {
+                notifySW({ type: 'DOWNLOAD_READY', relayToContent: true });
+            }
+        })();
+    }
+}
+
+// ── Sentence assignment (round-robin across workers) ─────────────────────────
+
+/**
+ * Split sentences across workers by alternating global index.
+ * Worker 0 gets even-indexed sentences, worker 1 gets odd-indexed, etc.
+ *
+ * @param {Array} sentences - Array of sentence objects
+ * @param {number} startIndex - Global start index for these sentences
+ * @returns {Array<{ sentences: Array, indices: number[] }>}
+ */
+function assignSentencesToWorkers(sentences, startIndex) {
+    const assignments = workers.map(() => ({ sentences: [], indices: [] }));
+
+    for (let i = 0; i < sentences.length; i++) {
+        const globalIndex = startIndex + i;
+        const workerIdx   = globalIndex % workers.length;
+        assignments[workerIdx].sentences.push(sentences[i]);
+        assignments[workerIdx].indices.push(globalIndex);
+    }
+
+    return assignments;
+}
+
+/**
+ * Cancel all workers, reset reorder state, and dispatch sentence slices
+ * to each worker via GENERATE_AUDIO with sentenceIndices.
+ */
+function dispatchToWorkers(sentences, startIndex, voice) {
+    const assignments    = assignSentencesToWorkers(sentences, startIndex);
+    const totalSentences = startIndex + sentences.length;
+
+    // Reset reorder buffer for the new generation
+    reorderBuffer.clear();
+    nextFlushIndex    = startIndex;
+    activeWorkerCount = 0;
+    workersDoneCount  = 0;
+    workerAssignments.clear();
+
+    currentGenId++;
+
+    for (let w = 0; w < workers.length; w++) {
+        workers[w].postMessage({ type: 'CANCEL' });
+
+        if (assignments[w].sentences.length === 0) continue;
+
+        const msg = {
+            type:            'GENERATE_AUDIO',
+            sentences:       assignments[w].sentences,
+            sentenceIndices: assignments[w].indices,
+            totalSentences,
+            speed:           currentUserSpeed,
+            voice:           voice || currentVoiceName,
+            genId:           currentGenId,
+        };
+        workers[w].postMessage(msg);
+        // Record so a crashed worker can be re-dispatched
+        workerAssignments.set(w, {
+            sentences:       assignments[w].sentences,
+            indices:         assignments[w].indices,
+            totalSentences,
+        });
+        activeWorkerCount++;
+    }
+
+    console.log(`[offscreen] dispatched ${sentences.length} sentences to ${activeWorkerCount} worker(s) from index ${startIndex}`);
 }
 
 // ── Start generation from extraction result ──────────────────────────────────
@@ -259,29 +526,23 @@ async function startGeneration(message) {
     generationDone = false;
     chunkSaveIndex = 0;
     lastSentenceGenerated = -1;
+    allSentences   = message.sentences || [];
     // Clear queue and pending resume so stale work doesn't re-trigger after completion
     pendingExtractionQueue = [];
     pendingResume = null;
 
     // Persist sentence list for resume after offscreen restart
-    if (currentPageUrl && message.sentences?.length > 0) {
+    if (currentPageUrl && allSentences.length > 0) {
         saveGenerationJob(currentPageUrl, {
-            sentences: message.sentences, title: articleTitle,
+            sentences: allSentences, title: articleTitle,
         }).catch(() => {});
     }
 
-    currentGenId++;
-    ttsWorker.postMessage({ type: 'CANCEL' });
-    ttsWorker.postMessage({
-        type:      'GENERATE_AUDIO',
-        sentences: message.sentences,
-        speed:     currentUserSpeed,
-        voice:     currentVoiceName,
-        genId:     currentGenId,
-    });
+    dispatchToWorkers(allSentences, 0, currentVoiceName);
 
-    const title = articleTitle ? `"\u200B${articleTitle.slice(0, 35)}"` : 'page';
-    notifySW({ type: 'STATUS_UPDATE', text: `${message.wordCount} words from ${title} \u2014 generating\u2026`, relayToContent: true });
+    const title      = articleTitle ? `"\u200B${articleTitle.slice(0, 35)}"` : 'page';
+    const turboLabel = workers.length > 1 ? ' (turbo)' : '';
+    notifySW({ type: 'STATUS_UPDATE', text: `${message.wordCount} words from ${title} \u2014 generating${turboLabel}\u2026`, relayToContent: true });
 }
 
 // ── WAV / Opus export (download from IDB cache) ─────────────────────────────
@@ -339,7 +600,10 @@ async function handleDownloadRequest() {
             entries = chunks;
         }
     }
-    if (entries.length === 0) return;
+    if (entries.length === 0) {
+        notifySW({ type: 'STATUS_UPDATE', text: 'Nothing to download yet — wait for generation to start', relayToContent: true });
+        return;
+    }
 
     // Merge all chunks into one Float32Array
     const allData = entries.map(e => e.data instanceof Float32Array ? e.data : new Float32Array(e.data));
@@ -370,6 +634,15 @@ async function handleDownloadRequest() {
     }
 }
 
+// ── Helper: cancel all workers ───────────────────────────────────────────────
+
+function cancelAllWorkers() {
+    for (const worker of workers) {
+        worker.postMessage({ type: 'CANCEL' });
+    }
+    reorderBuffer.clear();
+}
+
 // ── Incoming messages ────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -377,7 +650,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     switch (message.type) {
         case 'EXTRACTION_RESULT': {
-            if (!modelReady || !ttsWorker) {
+            if (!allWorkersReady || workers.length === 0) {
                 // Queue the message — MODEL_READY will start the most-recent entry
                 pendingExtractionQueue.push(message);
                 notifySW({ type: 'STATUS_UPDATE', text: 'Loading model\u2026 (text ready)', relayToContent: true, relayToOnboarding: true });
@@ -390,8 +663,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         case 'SWITCH_VOICE': {
             currentVoiceName = message.voice;
-            if (ttsWorker && modelReady) {
-                ttsWorker.postMessage({ type: 'SWITCH_VOICE', voice: message.voice });
+            if (allWorkersReady) {
+                for (const worker of workers) {
+                    worker.postMessage({ type: 'SWITCH_VOICE', voice: message.voice });
+                }
             }
             return false;
         }
@@ -401,28 +676,35 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             if (message.action === 'SWITCH_VOICE') {
                 // Simple voice switch (not mid-generation) — update preference only
                 currentVoiceName = message.voice;
-                if (ttsWorker && modelReady) {
-                    ttsWorker.postMessage({ type: 'SWITCH_VOICE', voice: message.voice });
+                if (allWorkersReady) {
+                    for (const worker of workers) {
+                        worker.postMessage({ type: 'SWITCH_VOICE', voice: message.voice });
+                    }
                 }
             } else if (message.action === 'SET_SPEED') {
                 currentUserSpeed = message.speed;
             } else if (message.action === 'VOICE_SWITCH_RESTART') {
-                // Mid-generation voice switch: cancel current generation, clear IDB chunks,
+                // Mid-generation voice switch: cancel all workers, clear IDB chunks,
                 // reload the saved job, and restart from fromSentenceIndex with new voice.
                 const { voice, fromSentenceIndex } = message;
                 console.log('[offscreen] VOICE_SWITCH_RESTART: voice=', voice, 'from=', fromSentenceIndex);
 
                 currentVoiceName = voice;
-                currentGenId++;
-                ttsWorker.postMessage({ type: 'CANCEL' });
 
                 (async () => {
                     try {
-                        const job = await loadGenerationJob(currentPageUrl);
+                        // Prefer in-memory sentence list; fall back to IDB job
+                        const job = allSentences.length > 0
+                            ? { sentences: allSentences }
+                            : await loadGenerationJob(currentPageUrl);
+
                         if (!job?.sentences?.length) {
                             console.warn('[offscreen] VOICE_SWITCH_RESTART: no saved job');
                             return;
                         }
+
+                        cancelAllWorkers();
+
                         // Clear old-voice chunks from IDB so the cache won't be mixed
                         await clearChunks(currentPageUrl);
                         chunkSaveIndex        = 0;
@@ -432,15 +714,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                         // Re-persist the job (clearChunks doesn't touch jobs store)
                         await saveGenerationJob(currentPageUrl, job).catch(() => {});
 
-                        currentGenId++;
-                        ttsWorker.postMessage({
-                            type:        'GENERATE_AUDIO',
-                            sentences:   job.sentences.slice(fromSentenceIndex),
-                            speed:       currentUserSpeed,
-                            voice,
-                            genId:       currentGenId,
-                            indexOffset: fromSentenceIndex,
-                        });
+                        const remainingSentences = job.sentences.slice(fromSentenceIndex);
+                        dispatchToWorkers(remainingSentences, fromSentenceIndex, voice);
+
                         notifySW({ type: 'STATUS_UPDATE', text: 'Switching voice\u2026', relayToContent: true });
                     } catch (err) {
                         console.error('[offscreen] VOICE_SWITCH_RESTART error:', err);
@@ -457,7 +733,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         case 'STOP':
         case 'CANCEL_ALL': {
-            if (ttsWorker) ttsWorker.postMessage({ type: 'CANCEL' });
+            cancelAllWorkers();
             generationDone = true;
             return false;
         }
@@ -466,7 +742,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             // Tab was refreshed or navigated — cancel generation and clear any
             // incomplete chunks so stale data doesn't persist across page loads.
             const unloadUrl = message.url ? normUrl(message.url) : currentPageUrl;
-            if (ttsWorker) ttsWorker.postMessage({ type: 'CANCEL' });
+            cancelAllWorkers();
             generationDone = true;
             if (unloadUrl) {
                 clearChunks(unloadUrl).catch(() => {});
@@ -476,8 +752,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'CLOSE_WIDGET': {
-            // Cancel generation — stop the worker from producing more chunks
-            if (ttsWorker) ttsWorker.postMessage({ type: 'CANCEL' });
+            // Cancel generation — stop all workers from producing more chunks
+            cancelAllWorkers();
             generationDone = true;
 
             // Save position from content script's reported pauseTime
@@ -512,7 +788,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                 // Check if we're currently generating for this URL
                 const urlMatches = !message.url || !currentPageUrl ||
                     normUrl(message.url) === currentPageUrl;
-                const isGenerating = !generationDone && ttsWorker && urlMatches && lastSentenceGenerated >= 0;
+                // Include allSentences.length > 0 so we catch the first ~3s of generation
+                // before any SENTENCE_COMPLETE has fired (lastSentenceGenerated is still -1).
+                const isGenerating = !generationDone && workers.length > 0 && urlMatches
+                    && (lastSentenceGenerated >= 0 || allSentences.length > 0);
 
                 if (isGenerating) {
                     sendResponse({ hit: false, hasAudio: false, generating: true });
@@ -547,8 +826,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     const resumeAt = savedPos?.position ?? 0;
 
                     // Stream entries one-by-one to avoid Chrome's 64MiB per-message limit.
-                    // A full-length article can easily have 100–300 MB of audio in total.
-                    // Each individual chunk is ~500 KB — well within the limit.
                     notifySW({
                         type:           'CACHE_LOAD_START',
                         count:          cached.entries.length,
@@ -558,7 +835,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     });
 
                     for (const entry of cached.entries) {
-                        // entry.data is an ArrayBuffer (decompressed from Int16 by loadFromCache)
                         const floatData = entry.data instanceof Float32Array ? entry.data
                             : new Float32Array(entry.data);
 
@@ -597,7 +873,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                         return;
                     }
 
-                    articleTitle = job.title || '';
+                    articleTitle  = job.title || '';
+                    allSentences = job.sentences;
 
                     // Find last generated sentence from IDB chunks
                     const chunks = await loadChunks(url);
@@ -648,18 +925,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     console.log(`[offscreen] RESUME_GENERATION: from sentence ${resumeFrom}/${job.sentences.length}`);
 
                     const doResume = () => {
-                        currentGenId++;
-                        ttsWorker.postMessage({
-                            type:        'GENERATE_AUDIO',
-                            sentences:   resumeSentences,
-                            speed:       currentUserSpeed,
-                            voice:       currentVoiceName,
-                            genId:       currentGenId,
-                            indexOffset: resumeFrom,
-                        });
+                        dispatchToWorkers(resumeSentences, resumeFrom, currentVoiceName);
                     };
 
-                    if (modelReady) {
+                    if (allWorkersReady) {
                         doResume();
                     } else {
                         pendingResume = doResume;
@@ -673,7 +942,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         case 'CHECK_ALIVE': {
             // SW pings offscreen to verify it's alive
-            sendResponse({ alive: true, modelReady, generating: !generationDone });
+            sendResponse({ alive: true, modelReady: allWorkersReady, generating: !generationDone });
             return true;
         }
     }
@@ -686,11 +955,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 async function loadPreferences() {
     try {
         if (!chrome.storage?.local) return 'af_aoede';
-        const result = await chrome.storage.local.get(['voice', 'speed']);
+        const result = await chrome.storage.local.get(['voice', 'speed', 'turboMode']);
         if (result.speed != null) {
             const speed = parseFloat(result.speed);
             if (speed >= 0.5 && speed <= 2.0) currentUserSpeed = speed;
         }
+        // Turbo mode defaults to true — user can disable via storage
+        turboMode = result.turboMode !== false;
         return result.voice || 'af_aoede';
     } catch (_) {
         return 'af_aoede';
@@ -701,8 +972,8 @@ async function loadPreferences() {
     console.log('[offscreen] initializing...');
     const voice = await loadPreferences();
     currentVoiceName = voice;
-    console.log('[offscreen] loaded prefs, voice:', voice, 'speed:', currentUserSpeed);
-    initWorker(voice);
+    console.log('[offscreen] loaded prefs, voice:', voice, 'speed:', currentUserSpeed, 'turbo:', turboMode);
+    initWorkers(voice);
     clearExpired().catch(() => {});
     notifySW({ type: 'OFFSCREEN_READY' });
 })();

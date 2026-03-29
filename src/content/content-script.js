@@ -28,6 +28,7 @@ import {
     createWidget, showWidget, hideWidget,
     updateState, updateStatus, updateSeeker,
     markGenerationDone, setActionHandler, updateReadMode,
+    updateTurboMode,
 } from '../widget/widget.js';
 import { prepareHighlighter, highlightSentence, clearHighlight } from '../utils/highlight-injector.js';
 import * as audioPlayer from './audio-player.js';
@@ -47,6 +48,10 @@ let lastExtractionResult = null;
 let pendingCacheEntries   = [];
 let pendingCacheResume    = 0;
 let pendingCacheTitle     = '';
+// Safety timeout: if CACHE_LOAD_DONE never arrives (offscreen killed mid-stream),
+// release the accumulated entries so they don't hold memory indefinitely.
+let pendingCacheTimeoutId = null;
+const CACHE_LOAD_TIMEOUT_MS = 30000;
 
 // Target seek time after a GC-triggered cache reload. Set by the needCacheReload
 // callback, consumed by the CACHE_LOAD_DONE handler once audio is restored.
@@ -76,18 +81,32 @@ function setWidgetState(state) {
 
 function injectWidget() {
     if (widgetInjected) return;
+
+    // Guard: document.body may be null on PDF viewers and some special pages.
+    // Don't set widgetInjected=true until the DOM append actually succeeds so
+    // a future SHOW_WIDGET can retry once the body is available.
+    if (!document.body) {
+        console.warn('[content-script] injectWidget: document.body not ready — skipping');
+        return;
+    }
+
     widgetInjected = true;
 
-    const shadowHost = document.createElement('div');
-    shadowHost.id = 'kokoro-tts-host';
-    shadowHost.style.cssText = 'position:fixed;top:125px;right:200px;z-index:2147483647;pointer-events:none;';
-    document.body.appendChild(shadowHost);
+    try {
+        const shadowHost = document.createElement('div');
+        shadowHost.id = 'kokoro-tts-host';
+        shadowHost.style.cssText = 'position:fixed;top:125px;right:200px;z-index:2147483647;pointer-events:none;';
+        document.body.appendChild(shadowHost);
 
-    const shadow = shadowHost.attachShadow({ mode: 'closed' });
-    createWidget(shadow, shadowHost);
+        const shadow = shadowHost.attachShadow({ mode: 'closed' });
+        createWidget(shadow, shadowHost);
 
-    // Wire up all widget actions to the local handler
-    setActionHandler(handleWidgetAction);
+        // Wire up all widget actions to the local handler
+        setActionHandler(handleWidgetAction);
+    } catch (err) {
+        console.error('[content-script] injectWidget failed:', err);
+        widgetInjected = false; // allow retry on next SHOW_WIDGET
+    }
 }
 
 // ── Read-mode callbacks ───────────────────────────────────────────────────────
@@ -314,6 +333,27 @@ function handleWidgetAction(action) {
             chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', action: 'REQUEST_DOWNLOAD' }).catch(() => {});
             break;
 
+        case 'TOGGLE_TURBO': {
+            const enabled = action.enabled;
+            audioPlayer.setTurboMode(enabled);
+            chrome.storage.local.set({ turboMode: enabled }).catch(() => {});
+            // Worker count can only change when offscreen is recreated on the next
+            // generation — surface this to the user so the button state is not confusing.
+            const playerState = audioPlayer.getState();
+            const isActiveGeneration = playerState.hasAudio && !playerState.generationDone;
+            if (isActiveGeneration) {
+                updateStatus(`Turbo ${enabled ? 'ON' : 'OFF'} — takes effect next article`);
+            }
+            console.log(`[content-script] turbo mode ${enabled ? 'ON' : 'OFF'}`);
+            break;
+        }
+
+        case 'SET_TURBO_INITIAL': {
+            // Widget loaded prefs and is informing us of the initial turbo state
+            audioPlayer.setTurboMode(action.enabled);
+            break;
+        }
+
         default:
             // Forward anything else to offscreen via SW
             chrome.runtime.sendMessage({ type: 'WIDGET_ACTION', ...action }).catch(() => {});
@@ -491,9 +531,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         // limit. We buffer them here and hand them to the audio player on DONE.
         case 'CACHE_LOAD_START': {
             console.log('[content-script] CACHE_LOAD_START:', message.count, 'chunks');
+            // Clear any previous in-flight load before starting a new one
+            if (pendingCacheTimeoutId) {
+                clearTimeout(pendingCacheTimeoutId);
+                pendingCacheTimeoutId = null;
+            }
             pendingCacheEntries = [];
             pendingCacheResume  = message.resumePosition ?? 0;
             pendingCacheTitle   = message.title ?? '';
+            // Safety: release entries if CACHE_LOAD_DONE never arrives
+            pendingCacheTimeoutId = setTimeout(() => {
+                console.warn('[content-script] CACHE_LOAD_DONE never arrived — releasing pending entries');
+                pendingCacheEntries   = [];
+                pendingCacheTimeoutId = null;
+            }, CACHE_LOAD_TIMEOUT_MS);
             return false;
         }
 
@@ -509,6 +560,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
 
         case 'CACHE_LOAD_DONE': {
+            if (pendingCacheTimeoutId) {
+                clearTimeout(pendingCacheTimeoutId);
+                pendingCacheTimeoutId = null;
+            }
             console.log('[content-script] CACHE_LOAD_DONE:', pendingCacheEntries.length, 'chunks buffered');
             audioPlayer.loadCachedAudio(pendingCacheEntries, pendingCacheResume);
             chunksReady = true;
@@ -627,6 +682,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // Prevents stale incomplete chunks from accumulating in IDB across page loads.
 
 window.addEventListener('pagehide', () => {
+    // Release AudioContext + audioHistory before the page is torn down.
+    // Without this, the AudioContext stays open holding the audio device, and
+    // audioHistory (potentially hundreds of MB of Float32 data) stays in memory.
+    // On SPAs this also handles client-side navigation where pagehide fires.
+    audioPlayer.reset();
+
     chrome.runtime.sendMessage({ type: 'PAGE_UNLOAD', url: location.href }).catch(() => {});
     // Save read mode bookmark on unload if a session is active
     if (isReadModeEnabled() && getReadModeSentences().length > 0) {

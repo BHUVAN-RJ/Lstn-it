@@ -52,6 +52,10 @@ let voiceNotifyTimeout = null;
 // Read mode state
 let readModeBtn    = null;
 let readModeActive = false;
+
+// Turbo mode state
+let turboBtn    = null;
+let turboActive = true; // default ON
 let wpmValueEl     = null;
 let speedContainerEl = null;
 let wpmContainerEl   = null;
@@ -117,12 +121,25 @@ export function createWidget(shadow, shadowHost) {
     readModeBtn = document.createElement('button');
     readModeBtn.className = 'tts-read-btn';
     readModeBtn.textContent = 'Read Only';
-    readModeBtn.title = 'Toggle read-only mode (highlight sentences at reading pace, no audio)';
+    readModeBtn.title = 'Read Only mode ON';
     readModeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         dispatchAction({ action: 'TOGGLE_READ_MODE' });
     });
     topControls.appendChild(readModeBtn);
+
+    turboBtn = document.createElement('button');
+    turboBtn.className = 'tts-turbo-btn active';
+    turboBtn.textContent = 'Turbo';
+    turboBtn.title = 'Turbo mode ON';
+    turboBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        turboActive = !turboActive;
+        turboBtn.classList.toggle('active', turboActive);
+        turboBtn.title = turboActive ? 'Turbo mode ON' : 'Turbo mode OFF';
+        dispatchAction({ action: 'TOGGLE_TURBO', enabled: turboActive });
+    });
+    topControls.appendChild(turboBtn);
 
     downloadBtn = document.createElement('button');
     downloadBtn.className = 'tts-download-circle-btn';
@@ -301,7 +318,7 @@ function buildVoiceOptions(select) {
 
 async function loadWidgetPreferences(voiceSelect, speedSlider, speedValue) {
     try {
-        const result = await chrome.storage.local.get(['voice', 'speed', 'widgetPosX', 'widgetPosY']);
+        const result = await chrome.storage.local.get(['voice', 'speed', 'widgetPosX', 'widgetPosY', 'turboMode']);
         const savedVoice = result.voice && voiceSelect.querySelector(`option[value="${result.voice}"]`)
             ? result.voice
             : 'af_aoede';
@@ -318,6 +335,14 @@ async function loadWidgetPreferences(voiceSelect, speedSlider, speedValue) {
                 speedValue.textContent = formatSpeed(speed);
             }
         }
+        // Restore turbo mode preference (default: true)
+        turboActive = result.turboMode !== false;
+        if (turboBtn) {
+            turboBtn.classList.toggle('active', turboActive);
+        }
+        // Notify content-script of initial turbo state
+        dispatchAction({ action: 'SET_TURBO_INITIAL', enabled: turboActive });
+
         // Restore saved drag position, clamped to the current viewport dimensions
         if (result.widgetPosX != null && result.widgetPosY != null) {
             const vw = window.innerWidth;
@@ -562,9 +587,7 @@ export function updateReadMode(active, wpm) {
 
     if (readModeBtn) {
         readModeBtn.classList.toggle('active', active);
-        readModeBtn.title = active
-            ? 'Read-only mode active — click to disable'
-            : 'Toggle read-only mode (highlight sentences at reading pace, no audio)';
+        readModeBtn.title = active ? 'Read Only mode ON' : 'Read Only mode OFF';
     }
 
     // Swap left radial: speed ↔ WPM control
@@ -576,6 +599,14 @@ export function updateReadMode(active, wpm) {
 
     if (wpmValueEl && wpm != null) {
         wpmValueEl.textContent = `${wpm} wpm`;
+    }
+}
+
+export function updateTurboMode(active) {
+    turboActive = active;
+    if (turboBtn) {
+        turboBtn.classList.toggle('active', active);
+        turboBtn.title = active ? 'Turbo mode ON' : 'Turbo mode OFF';
     }
 }
 

@@ -222,11 +222,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
             // Actions that need to reach offscreen (generation-related)
             const offscreenActions = {
-                'SWITCH_VOICE': { type: 'SWITCH_VOICE', voice: message.voice },
-                'STOP':         { type: 'STOP' },
-                'CLOSE_WIDGET': { type: 'CLOSE_WIDGET', pausedAtTime: message.pausedAtTime },
-                'REQUEST_DOWNLOAD': { type: 'REQUEST_DOWNLOAD' },
-                'SET_SPEED':    { type: 'SET_SPEED', speed: message.speed },
+                'SWITCH_VOICE':        { type: 'SWITCH_VOICE', voice: message.voice },
+                'STOP':                { type: 'STOP' },
+                'CLOSE_WIDGET':        { type: 'CLOSE_WIDGET', pausedAtTime: message.pausedAtTime },
+                'REQUEST_DOWNLOAD':    { type: 'REQUEST_DOWNLOAD' },
+                'SET_SPEED':           { type: 'SET_SPEED', speed: message.speed },
+                // VOICE_SWITCH_RESTART also reaches offscreen via runtime.sendMessage
+                // (content scripts → runtime.sendMessage reaches SW + offscreen simultaneously),
+                // but mapping it here gives us the dead-offscreen retry path.
+                'VOICE_SWITCH_RESTART': {
+                    type:              'WIDGET_ACTION',
+                    action:            'VOICE_SWITCH_RESTART',
+                    voice:             message.voice,
+                    fromSentenceIndex: message.fromSentenceIndex,
+                },
             };
 
             const mapped = offscreenActions[message.action];
@@ -235,8 +244,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     if (err?.message?.includes('Receiving end does not exist')) {
                         console.warn('[service-worker] offscreen gone — recreating');
                         await ensureOffscreenDocument();
-                        // If it was a close/stop, no need to resume
-                        // If it was a voice switch, the new offscreen will pick up from storage
+                        // OFFSCREEN_READY will trigger resume via the normal recovery path.
+                        // For close/stop no further action is needed.
                     }
                 });
             }

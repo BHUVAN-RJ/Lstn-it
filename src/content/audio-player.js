@@ -20,13 +20,24 @@ let pausedAtTime           = 0;
 let pausedAtWallClock      = 0; // Date.now() when pause() was called
 
 // Pre-buffer: accumulate chunks before starting playback
-const PREBUFFER_COUNT = 3;
+const PREBUFFER_COUNT_NORMAL = 2;
+const PREBUFFER_COUNT_TURBO  = 1;
+let prebufferCount  = PREBUFFER_COUNT_TURBO; // default: turbo ON
 let pendingChunks   = [];
 let playbackStarted = false; // true once startPlayback() has run
 
+// Short-first-chunk handling: if the first countAsChunk chunk is < this many seconds,
+// require one extra chunk before starting (avoids a long silence gap after a short opener).
+const SHORT_FIRST_CHUNK_THRESHOLD_S = 2.0;
+// First-chunk warm-up: always schedule the first buffered chunk slightly slower so the
+// audio context and speaker have time to stabilise before full-speed audio hits.
+const FIRST_CHUNK_WARMUP_SPEED = 0.9;
+
 // Adaptive slowdown — buys inference time when buffer runs thin
+// Disabled in turbo mode (dual workers produce chunks fast enough)
 const SLOW_THRESHOLD = 2;
 const SLOW_RATE      = 0.9;
+let turboEnabled  = true; // mirrors chrome.storage.local turboMode
 let chunksAhead = 0;
 
 // User speed (0.5–2.0) applied via WSOLA at scheduling time
@@ -69,6 +80,13 @@ let stallTimer = null;
 const GC_LOOKBACK_SECONDS = 120;
 // Tracks the relStart time below which data has already been released.
 let gcWatermarkTime = 0;
+// Last elapsed-second at which GC ran — prevents the progress interval from
+// triggering GC on every tick that shares the same floor value (10 ticks/boundary).
+let lastGcElapsedSec = -1;
+
+// Short-first-chunk: set to true when the first countAsChunk chunk arrives with a
+// duration below SHORT_FIRST_CHUNK_THRESHOLD_S, so we require one extra chunk.
+let firstChunkIsShort = false;
 
 // ── Callbacks (set via init) ─────────────────────────────────────────────────
 let onStateChange      = () => {};
@@ -136,8 +154,10 @@ export function reset() {
     historyTotalDuration   = 0;
     inVoiceTransition      = false;
     transitionPendingChunks = [];
-    // Reset GC watermark so a fresh generation starts clean
+    // Reset GC state so a fresh generation starts clean
     gcWatermarkTime        = 0;
+    lastGcElapsedSec       = -1;
+    firstChunkIsShort      = false;
 }
 
 function stopAllSources() {
@@ -223,8 +243,13 @@ function startPlayback() {
     playbackStarted = true;
 
     console.log('[audio-player] startPlayback: scheduling', pendingChunks.length, 'buffered chunks');
+    let isFirstChunk = true;
     for (const chunk of pendingChunks) {
-        scheduleChunk(chunk, false);
+        // Schedule the very first chunk at a slightly reduced speed so the audio
+        // context and speaker have time to stabilise before full-speed audio hits.
+        const speedOverride = isFirstChunk ? FIRST_CHUNK_WARMUP_SPEED * currentSpeed : null;
+        scheduleChunk(chunk, false, speedOverride);
+        if (chunk.countAsChunk) isFirstChunk = false;
     }
     pendingChunks = [];
 
@@ -286,10 +311,22 @@ export function queueChunk(chunkData) {
         pendingChunks.push(chunk);
         const sentenceCount = pendingChunks.filter(c => c.countAsChunk).length;
 
-        onStatusUpdate(`Buffering\u2026 (${sentenceCount}/${PREBUFFER_COUNT})`);
+        // On the very first countAsChunk chunk, check if it's too short to play alone.
+        // A short opener (< SHORT_FIRST_CHUNK_THRESHOLD_S) followed by silence feels broken,
+        // so we require one extra chunk to arrive before starting playback.
+        if (sentenceCount === 1 && chunk.countAsChunk) {
+            const chunkDurationS = chunk.samples.length / (chunk.sampleRate || 24000);
+            if (chunkDurationS < SHORT_FIRST_CHUNK_THRESHOLD_S) {
+                firstChunkIsShort = true;
+                console.log(`[audio-player] first chunk short (${chunkDurationS.toFixed(2)}s) — waiting for one more`);
+            }
+        }
+
+        const requiredCount = firstChunkIsShort ? prebufferCount + 1 : prebufferCount;
+        onStatusUpdate(`Buffering\u2026 (${sentenceCount}/${requiredCount})`);
         onStateChange('loading');
 
-        if (sentenceCount >= PREBUFFER_COUNT) {
+        if (sentenceCount >= requiredCount) {
             // Auto-start playback once enough chunks are buffered
             startPlayback();
         }
@@ -323,9 +360,9 @@ export function queueChunk(chunkData) {
         return;
     }
 
-    // Already playing — schedule with adaptive slowdown
+    // Already playing — schedule with adaptive slowdown (disabled in turbo mode)
     const strictlyAhead = chunksAhead - 1;
-    const slowMode = !generationDone && (strictlyAhead <= SLOW_THRESHOLD);
+    const slowMode = !turboEnabled && !generationDone && (strictlyAhead <= SLOW_THRESHOLD);
     if (slowMode) {
         console.log(`[audio-player] slow mode — chunks ahead: ${strictlyAhead}, WSOLA at ${SLOW_RATE}\u00d7`);
     }
@@ -433,6 +470,12 @@ export function stop() {
 
 export function setSpeed(speed) {
     currentSpeed = speed;
+}
+
+export function setTurboMode(enabled) {
+    turboEnabled = enabled;
+    prebufferCount = enabled ? PREBUFFER_COUNT_TURBO : PREBUFFER_COUNT_NORMAL;
+    console.log(`[audio-player] turbo mode ${enabled ? 'ON' : 'OFF'} — prebuffer=${prebufferCount}`);
 }
 
 export function markGenerationDone() {
@@ -685,20 +728,16 @@ function resetHighlightIndex() {
 // ── GC: free Float32 sample data for chunks well behind current playback ─────
 
 /**
- * Release Float32Array sample data for audioHistory entries that are more than
- * GC_LOOKBACK_SECONDS behind the current elapsed time.
- * Metadata (relStart, duration, sentenceIndex) is kept so seek and highlight
- * continue to work for the retained window.
+ * Core GC: release Float32 sample data for all audioHistory entries whose
+ * relStart + duration falls before `boundary` seconds.
+ * Metadata is kept so seek/highlight continue to work for the retained window.
  */
-function gcReleasedChunks() {
-    if (!audioContext || !isPlaying || audioHistory.length === 0) return;
-    const elapsed = audioContext.currentTime - firstChunkStartTime;
-    const boundary = elapsed - GC_LOOKBACK_SECONDS;
+function gcAtBoundary(boundary) {
     if (boundary <= gcWatermarkTime || boundary <= 0) return;
+    if (audioHistory.length === 0) return;
 
     let releasedCount = 0;
     for (const entry of audioHistory) {
-        // Release only entries whose audio has fully played and is behind the boundary
         if (entry.data && entry.relStart + entry.duration < boundary) {
             entry.data = null;
             releasedCount++;
@@ -708,6 +747,16 @@ function gcReleasedChunks() {
         gcWatermarkTime = boundary;
         console.log(`[audio-player] GC: freed ${releasedCount} chunks before ${boundary.toFixed(1)}s`);
     }
+}
+
+/**
+ * Periodic GC — called from the progress interval during active playback.
+ * Skipped when not playing (isPlaying guard) to avoid work during pause.
+ */
+function gcReleasedChunks() {
+    if (!audioContext || !isPlaying || audioHistory.length === 0) return;
+    const elapsed = audioContext.currentTime - firstChunkStartTime;
+    gcAtBoundary(elapsed - GC_LOOKBACK_SECONDS);
 }
 
 // ── Progress tracking ────────────────────────────────────────────────────────
@@ -738,8 +787,12 @@ function startProgressTracking() {
             onPlaybackComplete();
         }
 
-        // Run GC roughly every 5 seconds to avoid per-tick overhead
-        if (Math.floor(elapsed) % 5 === 0) {
+        // Run GC once per 5-second window. Using a last-run tracker instead of
+        // modulo avoids the 10-consecutive-tick problem where Math.floor(elapsed)
+        // stays the same value for all 100ms ticks within the same second.
+        const elapsedSec = Math.floor(elapsed);
+        if (elapsedSec % 5 === 0 && elapsedSec !== lastGcElapsedSec) {
+            lastGcElapsedSec = elapsedSec;
             gcReleasedChunks();
         }
     }, 100);
@@ -754,7 +807,18 @@ function stopProgressTracking() {
 
 function onPlaybackComplete() {
     stopProgressTracking();
-    isPlaying       = false;
+    isPlaying = false;
+
+    // Suspend the AudioContext — article is done, no need to hold the audio
+    // hardware open. We suspend rather than close so the user can still seek.
+    if (audioContext && audioContext.state === 'running') {
+        audioContext.suspend().catch(() => {});
+    }
+
+    // Run a final GC pass. The normal gcReleasedChunks() is guarded by isPlaying,
+    // so it would never run here. For long articles this can free hundreds of MB.
+    gcAtBoundary(totalScheduledDuration - GC_LOOKBACK_SECONDS);
+
     onProgressUpdate(100, historyTotalDuration, historyTotalDuration);
     onStateChange('done');
     onStatusUpdate('Done');

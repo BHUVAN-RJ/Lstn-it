@@ -245,6 +245,41 @@ export const WIDGET_CSS = `
     background: #e8604e;
 }
 
+/* ── Turbo button (same style as Read Only) ──────────────────────────────── */
+.tts-turbo-btn {
+    height: 22px;
+    padding: 0 9px;
+    border-radius: 11px;
+    background: #fff;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 0 0 2px #FA8072, 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+    font-size: 10px;
+    font-weight: 600;
+    color: #FA8072;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+}
+
+.tts-turbo-btn:hover {
+    background: #fff0ee;
+    transform: scale(1.05);
+}
+
+.tts-turbo-btn.active {
+    background: #FA8072;
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(250, 128, 114, 0.4);
+}
+
+.tts-turbo-btn.active:hover {
+    background: #e8604e;
+}
+
 /* ── WPM control (replaces speed slider in read mode) ────────────────────── */
 .tts-wpm-control {
     display: flex;

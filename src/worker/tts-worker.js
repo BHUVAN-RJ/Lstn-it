@@ -593,7 +593,7 @@ async function runInference(tokenIds) {
  * @param {number} speed
  * @param {number} genId  - opaque ID echoed back in every AUDIO_CHUNK / GENERATION_DONE
  */
-async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, indexOffset = 0 }) {
+async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, indexOffset = 0, sentenceIndices = null, totalSentences = null }) {
     if (!session || !voiceData) {
         postError('MODEL_NOT_READY', 'Load the model first.');
         return;
@@ -618,7 +618,7 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, 
         console.log('[tts-worker] generateAudio: voice loaded, activeVoice =', activeVoice);
     }
 
-    const total = indexOffset + sentences.length; // global total including already-generated sentences
+    const total = totalSentences ?? (indexOffset + sentences.length);
 
     for (let i = 0; i < sentences.length; i++) {
         // Yield to the macrotask queue so that queued SWITCH_VOICE messages
@@ -627,6 +627,9 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, 
         // onmessage for SWITCH_VOICE never fires until generation completes.
         await new Promise(resolve => setTimeout(resolve, 0));
         if (cancelId !== myId) { isGenerating = false; return; }
+
+        // Resolve global sentence index — sentenceIndices (dual-worker) or fallback
+        const globalIndex = sentenceIndices ? sentenceIndices[i] : (indexOffset + i);
 
         // Check for mid-generation voice switch
         if (pendingVoice && pendingVoice !== activeVoice) {
@@ -685,7 +688,7 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, 
             // Log phonemes once per sentence (from first clause)
             if (ci === 0) {
                 console.log(`[tts-worker] [${i + 1}/${total}] phonemes (${phonemes.length} chars): "${phonemes.slice(0, 80)}${phonemes.length > 80 ? '…' : ''}"`);
-                post({ type: 'PHONEMES_READY', index: i, total, text, phonemes });
+                post({ type: 'PHONEMES_READY', index: globalIndex, total, text, phonemes });
             } else {
                 console.log(`[tts-worker] [${i + 1}/${total}] clause ${ci + 1}/${clauses.length} phonemes (${phonemes.length} chars): "${phonemes.slice(0, 60)}${phonemes.length > 60 ? '…' : ''}"`);
             }
@@ -736,7 +739,7 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, 
                 post(
                     {
                         type: 'AUDIO_CHUNK',
-                        index: indexOffset + i, // global sentence index
+                        index: globalIndex, // global sentence index
                         total,
                         samples: samplesCopy,
                         sampleRate: 24000,
@@ -751,6 +754,12 @@ async function generateAudio({ sentences, speed = 1.0, voice = null, genId = 0, 
                 );
             }
         }
+
+        // Signal that all chunks for this sentence have been posted.
+        // The offscreen reorder buffer uses this to know when a sentence is
+        // complete and safe to flush (even if it produced zero audio chunks).
+        if (cancelId !== myId) return;
+        post({ type: 'SENTENCE_COMPLETE', index: globalIndex, genId });
     }
 
     isGenerating = false;
