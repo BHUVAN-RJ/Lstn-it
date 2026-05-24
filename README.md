@@ -22,7 +22,7 @@ A Chrome Extension (Manifest V3) that reads web pages aloud using the [Kokoro ON
 - **Fully on-device** — 310MB Kokoro ONNX model runs via ONNX Runtime Web (WebAssembly)
 - **Streaming playback** — audio starts playing before the full article is processed
 - **28 voices** — American/British English, male/female options
-- **Turbo mode** — two parallel TTS workers for ~2× generation throughput
+- **Turbo mode** — two parallel TTS workers for ~2× generation throughput (measured on M4 Mac mini, averaged over 50 sentences)
 - **Sentence highlighting** — floating overlay highlights the sentence currently being read
 - **Speed control** — 0.5×–2.0× playback speed with pitch-preserving WSOLA
 - **Download** — export article audio as Opus or WAV
