@@ -40,6 +40,20 @@
             margin-bottom: 8px;
             text-align: center;
         }
+        .cws-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: #FA8072;
+            text-decoration: none;
+            margin-bottom: 10px;
+            opacity: 0.8;
+            transition: opacity 0.2s;
+        }
+        .cws-link:hover { opacity: 1; text-decoration: underline; }
+        .cws-link svg { width: 14px; height: 14px; fill: #FA8072; flex-shrink: 0; }
+
         .tagline {
             font-size: 15px;
             color: #888;
@@ -233,6 +247,10 @@
     </div>
 
     <h1>AudiTex</h1>
+    <a class="cws-link" href="https://chromewebstore.google.com/detail/auditex/YOUR_EXTENSION_ID" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
+        View on Chrome Web Store
+    </a>
     <p class="tagline">On-device text-to-speech &mdash; private, fast, and Truly free.</p>
 
     <!-- Setup progress card -->
