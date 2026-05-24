@@ -1,5 +1,7 @@
 # AudiTex — On-Device Text-to-Speech Chrome Extension
 
+[![Chrome Web Store](https://img.shields.io/badge/Chrome%20Web%20Store-Install-FA8072?logo=googlechrome&logoColor=white)](https://chromewebstore.google.com/detail/auditex/YOUR_EXTENSION_ID)
+
 A Chrome Extension (Manifest V3) that reads web pages aloud using the [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) model. All inference runs **locally in your browser** — no server, no API calls, no data leaves your device.
 
 **Current version: v0.3.2 — Dual-worker turbo mode**
@@ -35,12 +37,11 @@ A Chrome Extension (Manifest V3) that reads web pages aloud using the [Kokoro ON
 cd tts-extension
 npm install
 
-# 2. Copy the ONNX model into dist/ (only needed once — survives rebuilds)
-npm run copy-model
-
-# 3. Build the extension
+# 2. Build the extension
 npm run build
 ```
+
+> The Kokoro model (~310 MB) and voices auto-download from HuggingFace on first run and are cached locally — no manual setup needed.
 
 ### Load in Chrome
 
