@@ -8,6 +8,15 @@ A Chrome Extension (Manifest V3) that reads web pages aloud using the [Kokoro ON
 
 ---
 
+## How it works
+
+- A Web Worker generates audio in sentence-sized chunks using the Kokoro ONNX model running via WebAssembly.
+- An offscreen document reorders chunks from parallel workers and persists them to IndexedDB.
+- A content-script `AudioContext` schedules chunks ahead on the Web Audio clock for gapless playback.
+- When generation falls behind playback, audio is stretched 0.9× using pitch-preserving WSOLA to hide the gap.
+
+---
+
 ## Features
 
 - **Fully on-device** — 310MB Kokoro ONNX model runs via ONNX Runtime Web (WebAssembly)
