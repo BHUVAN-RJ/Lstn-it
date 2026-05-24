@@ -1,6 +1,6 @@
 # AudiTex — On-Device Text-to-Speech Chrome Extension
 
-Install from the Chrome Web Store: <CHROME_WEB_STORE_URL_HERE>
+Install from the Chrome Web Store: [Link](https://chromewebstore.google.com/detail/auditex-tts/ikiaabefahnnfjninfhfeolbgkfnldpa)
 
 A Chrome Extension (Manifest V3) that reads web pages aloud using the [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) model. All inference runs **locally in your browser** — no server, no API calls, no data leaves your device.
 
