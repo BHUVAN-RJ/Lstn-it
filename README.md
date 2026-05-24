@@ -37,7 +37,6 @@ A Chrome Extension (Manifest V3) that reads web pages aloud using the [Kokoro ON
 
 - Node.js 18+
 - Chrome (or any Chromium-based browser)
-- The Kokoro ONNX model file (`kokoro-v1.0.onnx`, ~310MB) placed in `models/`
 
 ### Setup
 
@@ -147,7 +146,7 @@ tts-extension/
 │       ├── onboarding.html         # First-run model download progress + error UI
 │       └── onboarding.js
 ├── models/
-│   ├── kokoro-v1.0.onnx            # 310MB — place here manually, then run copy-model
+│   ├── kokoro-v1.0.onnx            # auto-downloaded on first run, gitignored
 │   └── voices/                     # 28 voice .bin files (~510KB each)
 ├── test/
 └── dist/                           # Built extension — load this in Chrome
